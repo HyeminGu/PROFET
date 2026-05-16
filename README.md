@@ -75,8 +75,9 @@ PROFET has been applied to six experimental datasets spanning three biological c
 | `Patient_PA3.ipynb` | Patient PA3 (116 genes) | Palbociclib treatment (BMC cohort); day 0 → day 4 |
 | `Patient_862.ipynb` | Patient 862 (116 genes) | Palbociclib treatment (NatMed cohort); day 0 → day 4 |
 | `Patient_887.ipynb` | Patient 887 (116 genes) | Palbociclib treatment (NatMed cohort); day 0 → day 4 |
+| `LARRY_3000_benchmark.ipynb` | LARRY (3 000 cells) | Lineage-tracing benchmark; 3 timepoints (days 2, 4, 6); trains on days 2 → 6, validates at day 4 |
 
-Additional notebooks covering synthetic data (`Synthetic.ipynb`), the LARRY benchmark (`LARRY_3000_benchmark.ipynb`), and an Ornstein-Uhlenbeck toy example (`OU_process-GPA.ipynb`) are also provided.
+Additional notebooks covering synthetic data (`Synthetic.ipynb`) and an Ornstein-Uhlenbeck toy example (`OU_process-GPA.ipynb`) are also provided.
 
 ## Usage
 
@@ -137,6 +138,7 @@ Place each dataset under `data/`:
 | Patient PA3 | `Patient_PA3` | day 0 → day 4 | 116 |
 | Patient 862 | `Patient_862` | day 0 → day 4 | 116 |
 | Patient 887 | `Patient_887` | day 0 → day 4 | 116 |
+| LARRY | `LARRY_3000_benchmark` | 2, 4, 6 days | — |
 
 ## Utility modules
 
