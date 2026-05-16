@@ -1,0 +1,42 @@
+# fixed configurations for GPA step
+# full parameters can be found in scripts/GPA/lib/input_args.py
+# null converts to None in Python
+---
+# Data
+N_samples_Q: 0                  # total number of target samples
+N_samples_P: 0                  # total number of prior samples
+random_seed: 0                  # random seed
+rescale_factor: 1.0             # rescale data X by X*rescale_factor
+
+
+# (f, Gamma)-divergence
+f: KL                           # choices=['KL', 'alpha', 'reverse_KL', 'JS']
+alpha: null                     # parameter value for alpha divergence
+formulation: DV                 # LT or DV in case of f=KL, otherwise, keep LT
+Gamma: Lipschitz                # function space choices=['Lipshitz']
+L: 1.0                          # Lipshitz constant: default=inf w/o constraint
+reverse: False                  # True -> D(Q|P), False -> D(P|Q)
+
+
+# Neural Network discriminator <phi>
+N_fnn_layers:                   # list of the number of FNN hidden layer units
+    - 128
+    - 128
+    - 128
+activation_ftn:
+    - relu                      # [0]: hidden layers, [1]: last hidden layer
+                                # choices=['relu', 'mollified_relu_cos3', 'mollified_relu_poly3', 'softplus', 'leaky_relu', 'elu', 'bounded_relu', 'bounded_elu']
+
+# Discriminator training parameters
+epochs_phi: 5                   # numbef of updates for NN to find phi*
+lr_phi: 0.001                   # lr for NN
+optimizer: adam                 # optimizer for NN, choices=['sgd', 'adam',]
+
+# Particles transportation parameters
+epochs: 5000                    # number of updates for P
+f_Lip_threshold: 0.05           # threshold f_Lip value for termination
+ode_solver: forward_euler   # ode solver for particle ode, choices=['forward_euler', 'AB2', 'AB3', 'AB4', 'AB5', 'ABM1', 'Heun', 'ABM2', 'ABM3', 'ABM4', 'ABM5', 'RK4', 'ode45' ]
+
+# save/display
+save_iter: 20                   # save results per each save_iter
+...

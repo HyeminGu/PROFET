@@ -1,0 +1,47 @@
+# configuration for Labeled disease example
+# whose discriminator is parametrized by NN
+# null converts to None in Python
+---
+# Data
+N_samples_Q: 200            # total number of target samples
+N_samples_P: 200            # total number of prior samples
+N_dim: 2                    # dimension of input data
+dataset: Toy1
+random_seed: 0              # random seed for data generator
+rescale_factor: 1.0         # rescale data X by X*rescale_factor
+
+
+# (f, Gamma)-divergence
+f: KL                       # choices=['KL', 'alpha', 'reverse_KL', 'JS']
+alpha: null                 # parameter value for alpha divergence
+formulation: DV             # LT or DV in case of f=KL, otherwise, keep LT
+Gamma: Lipschitz            # function space choices=['Lipshitz']
+reverse: False              # True -> D(Q|P), False -> D(P|Q)
+
+
+# Neural Network discriminator <phi>
+N_fnn_layers:               # list of the number of FNN hidden layer units
+    - 32
+    - 32
+    - 32
+activation_ftn:
+    - relu                  # [0]: hidden layers, [1]: last hidden layer
+                            # choices=['relu', 'mollified_relu_cos3', 'mollified_relu_poly3', 'softplus', 'leaky_relu', 'elu', 'bounded_relu', 'bounded_elu']
+
+
+# Discriminator training parameters
+epochs_phi: 5               # numbef of updates for NN to find phi*
+lr_phi: 0.05                # lr for NN
+optimizer: adam             # optimizer for NN, choices=['sgd', 'adam',]
+
+# Particles transportation parameters
+f_Lip_threshold: !!float -inf
+adjust_lr_P_epochs: N
+epochs: 1000                # number of updates for P
+lr_P: 0.01                  # lr for P
+ode_solver: forward_euler   # ode solver for particle ode, choices=['forward_euler', 'AB2', 'AB3', 'AB4', 'AB5', 'ABM1', 'Heun', 'ABM2', 'ABM3', 'ABM4', 'ABM5', 'RK4', 'ode45' ]
+
+
+# save/display
+save_iter: 5                # save results per each save_iter
+...

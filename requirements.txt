@@ -1,0 +1,10 @@
+geomloss==0.2.6
+matplotlib==3.10.3
+numpy==1.23.3
+pandas==1.5.0
+PyYAML==6.0.2
+scikit-learn==1.2.1
+scipy==1.16.0
+tensorflow_macos==2.15.0
+torch==2.4.0
+notebook==6.4.12
