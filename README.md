@@ -138,7 +138,7 @@ Place each dataset under `data/`:
 | Patient PA3 | `Patient_PA3` | day 0 → day 4 | 116 |
 | Patient 862 | `Patient_862` | day 0 → day 4 | 116 |
 | Patient 887 | `Patient_887` | day 0 → day 4 | 116 |
-| LARRY | `LARRY_3000_benchmark` | 2, 4, 6 days | — |
+| LARRY | `LARRY_3000_benchmark` | 2, 4, 6 days | 3 000 |
 
 ## Utility modules
 
