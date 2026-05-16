@@ -16,7 +16,7 @@
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/PROFET.git
+git clone https://github.com/HyeminGu/PROFET.git
 cd PROFET
 pip install -r requirements.txt
 ```
