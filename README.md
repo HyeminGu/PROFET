@@ -124,7 +124,10 @@ notebooks/<Dataset>.ipynb
 
 ### Data directory layout
 
-Place each dataset under `data/<DatasetName>/`:
+Preprocessed datasets (`.pkl` files) are available for download at:
+[https://drive.google.com/drive/folders/1jrh3L8ZrHaGbSQDNA95ZXK383PaJvl9I?usp=drive_link](https://drive.google.com/drive/folders/1jrh3L8ZrHaGbSQDNA95ZXK383PaJvl9I?usp=drive_link)
+
+Place each dataset under `data/`:
 
 | Dataset | Subdirectory | Timepoints | Genes |
 |---|---|---|---|
