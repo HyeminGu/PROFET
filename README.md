@@ -129,14 +129,14 @@ Preprocessed datasets (`.pkl` files) are available for download at:
 
 Place each dataset under `data/`:
 
-| Dataset | Subdirectory | Timepoints | Genes |
+| Dataset | Variable name | Timepoints | Genes |
 |---|---|---|---|
-| EMT | `EMT_72genes/` | 0, 1, 2, 3, 4, 8 days | 72 |
-| Stem cell differentiation (mESC) | `Stem_Cell_Differentiation/` | 0, 1, 2, 3, 4 days | 101 |
-| MCF7 cell line | `MCF7 Cell Line/` | day 0 → day 4 (palbociclib) | 116 |
-| Patient PA3 | `Patient_PA3/` | day 0 → day 4 | 116 |
-| Patient 862 | `Patient_862/` | day 0 → day 4 | 116 |
-| Patient 887 | `Patient_887/` | day 0 → day 4 | 116 |
+| EMT | `EMT_72genes` | 0, 1, 2, 3, 4, 8 days | 72 |
+| Stem cell differentiation (mESC) | `Stem_Cell_Differentiation` | 0, 1, 2, 3, 4 days | 101 |
+| MCF7 cell line | `MCF7 Cell Line` | day 0 → day 4 (palbociclib) | 116 |
+| Patient PA3 | `Patient_PA3` | day 0 → day 4 | 116 |
+| Patient 862 | `Patient_862` | day 0 → day 4 | 116 |
+| Patient 887 | `Patient_887` | day 0 → day 4 | 116 |
 
 ## Utility modules
 
