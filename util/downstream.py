@@ -19,12 +19,1347 @@ from sklearn.preprocessing import MinMaxScaler
 import seaborn as sns
 from scipy import stats
 import matplotlib.patches as mpatches
+import tensorflow as tf
 from matplotlib.backends.backend_pdf import PdfPages
 from math import ceil
 from scipy.stats import gaussian_kde
 from matplotlib import colormaps
 
+def generate_static_cluster_plot_target_with_dfcluster_selected_clusters(
+    pca,
+    source_t, target_t, X1_trpts, mats, optimal_k, start_i, index, p,
+    df_cluster,
+    day_value=None,
+    day_col='day', cluster_col='cluster',
+    reverse=False, intermediate_t=[1,2,3],
+    d_red=2, random_state=42, exp_memo='experiment', output_file=None,
+    selected_clusters=None,          # e.g., [1,6,9]; None => use all present
+    hide_unselected=False,           # dim or hide unselected trajectories
+    bg_alpha=0.15,                   # background transparency
+    traj_alpha=0.9,                  # selected traj opacity
+    traj_gray_alpha=0.15,            # unselected traj opacity (if not hidden)
+    point_size=3, line_alpha=0.5, line_width=0.6,
+    cnv_lut=None,                    # pass your global_cnv_lut here
+    strict_colors=True,              # error if label color missing
+    color_mode='final'               # 'final' (default) or 'frame'
+):
+    """
+    Build PCA-space centroids for target-day cells grouped by predefined clusters
+    (from df_cluster[cluster_col], filtered by day only). Classify trajectory
+    snapshots by nearest centroid and plot:
+      - background (source/intermediate/target) = light gray (bg_alpha),
+      - selected clusters in consistent colors from cnv_lut,
+      - unselected either dim gray or hidden.
+
+    color_mode:
+      'final' -> color every frame by the final-frame label (stable per trajectory)
+      'frame' -> color each frame by instantaneous nearest centroid (changes over time)
+    """
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    # ---------- helpers ----------
+    def _reduce_if_needed(A, pca_obj):
+        ncomp = getattr(pca_obj, "n_components_", getattr(pca_obj, "n_components", None))
+        return (pca_obj.transform(A).astype(np.float32)
+                if A.shape[1] != ncomp else A.astype(np.float32))
+
+    def _build_centroids(X_red, y, keep=None):
+        cents = {}
+        keep_set = set(keep) if keep is not None else None
+        for lab in np.unique(y):
+            if keep_set is not None and lab not in keep_set:
+                continue
+            idx = (y == lab)
+            if np.any(idx):
+                cents[lab] = X_red[idx].mean(axis=0)
+        return cents
+
+    def _assign_by_centroid(X_red, cents):
+        labs = np.array(sorted(cents.keys()))
+        C = np.vstack([cents[k] for k in labs])  # (k, d)
+        d2 = ((X_red[:, None, :] - C[None, :, :])**2).sum(axis=2)
+        return labs[d2.argmin(axis=1)]
+
+    def _canon_key(x):
+        if pd.isna(x): return "NA"
+        try: return f"clone {int(x)}"
+        except Exception: return str(x)
+
+    # ---------- filtering by day only ----------
+    if day_value is None:
+        day_value = target_t
+
+    _ = p['numerical_ts'][-1] / 200  # bookkeeping (kept as-is)
+
+    if day_col not in df_cluster.columns:
+        raise ValueError(f"'{day_col}' not found in df_cluster columns.")
+
+    mask = (df_cluster[day_col] == day_value)
+    if not mask.any():
+        raise ValueError(f"No rows match day=={day_value}.")
+
+    df_sub = df_cluster.loc[mask]
+
+    # target data + predefined labels (must align by row)
+    X_target = mats[target_t]
+    if cluster_col not in df_sub.columns:
+        raise ValueError(f"'{cluster_col}' not found in filtered df_cluster.")
+    y_target = df_sub[cluster_col].to_numpy()
+
+    X_target_red = _reduce_if_needed(X_target, pca)
+    if len(y_target) != X_target_red.shape[0]:
+        raise ValueError(
+            f"Alignment mismatch: mats[target_t]={X_target_red.shape[0]} vs labels={len(y_target)}"
+        )
+
+    # selected clusters (optional)
+    if selected_clusters is not None:
+        selected_clusters = list(selected_clusters)
+        present = set(y_target)
+        missing = [c for c in selected_clusters if c not in present]
+        if len(missing) == len(selected_clusters):
+            raise ValueError(f"None of selected_clusters {selected_clusters} are present for the chosen day.")
+
+    # centroids restricted to selected (if provided)
+    centroids = _build_centroids(X_target_red, y_target, keep=selected_clusters)
+    if not centroids:
+        raise ValueError("No centroids built (after applying selected_clusters).")
+
+    # color policy: strictly from cnv_lut
+    if cnv_lut is None:
+        raise ValueError("Please pass `cnv_lut=global_cnv_lut` to enforce consistent clone colors.")
+
+    labels_we_might_draw = sorted(np.unique(list(centroids.keys())))
+    missing_keys = [lab for lab in labels_we_might_draw if _canon_key(lab) not in cnv_lut]
+    if missing_keys:
+        msg = f"Missing colors in cnv_lut for labels: {missing_keys} (canonical: {[ _canon_key(l) for l in missing_keys ]})"
+        if strict_colors:
+            raise KeyError(msg)
+        else:
+            print("[warn]", msg)
+
+    def _color(lab):
+        return cnv_lut.get(_canon_key(lab), "#333333")  # only used if strict_colors=False and label missing
+
+    # ---------- plotting ----------
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    # background (light gray)
+    X2_vis = _reduce_if_needed(mats[target_t], pca)
+    ax.scatter(X2_vis[:,0], X2_vis[:,1], color='lightgray', alpha=bg_alpha, s=10, zorder=5)
+
+    X1_vis = _reduce_if_needed(mats[source_t], pca)
+    ax.scatter(X1_vis[:,0], X1_vis[:,1], color='lightgray', alpha=bg_alpha, s=10, zorder=5)
+
+    for t in intermediate_t:
+        X_mid = _reduce_if_needed(mats[t], pca)
+        ax.scatter(X_mid[:,0], X_mid[:,1], color='lightgray', alpha=bg_alpha, s=10, zorder=5)
+
+    if index <= 0:
+        index = 1
+
+    # Precompute FINAL labels for coloring if requested
+    X1_hat_last = np.asarray(X1_trpts[-1], dtype=np.float32)
+    X1_hat_last_red = _reduce_if_needed(X1_hat_last, pca)
+    labels_final = _assign_by_centroid(X1_hat_last_red, centroids)  # final fates for each cell
+
+    sel_set = None if selected_clusters is None else set(selected_clusters)
+    prev_X = None
+    iters = range(len(X1_trpts))
+    if reverse:
+        iters = reversed(iters)
+
+    for i in iters:
+        if i < start_i or (i % index) != 0:
+            continue
+
+        X_now = np.asarray(X1_trpts[i], dtype=np.float32)
+        if np.isnan(X_now).any():
+            continue
+
+        X_now_red = _reduce_if_needed(X_now, pca)
+
+        if color_mode == 'final':
+            labels_i = labels_final
+        elif color_mode == 'frame':
+            labels_i = _assign_by_centroid(X_now_red, centroids)
+        else:
+            raise ValueError("color_mode must be 'final' or 'frame'.")
+
+        if sel_set is None:
+            # draw all in color
+            for lab in np.unique(labels_i):
+                idx = (labels_i == lab)
+                ax.scatter(X_now_red[idx,0], X_now_red[idx,1],
+                           c=_color(lab), alpha=traj_alpha, s=point_size, zorder=10)
+                if prev_X is not None:
+                    ax.plot(np.vstack([prev_X[idx,0], X_now_red[idx,0]]),
+                            np.vstack([prev_X[idx,1], X_now_red[idx,1]]),
+                            color=_color(lab), alpha=line_alpha, linewidth=line_width, zorder=9)
+        else:
+            sel_mask = np.isin(labels_i, list(sel_set))
+            # selected in color
+            if np.any(sel_mask):
+                for lab in np.unique(labels_i[sel_mask]):
+                    idx = (labels_i == lab)
+                    ax.scatter(X_now_red[idx,0], X_now_red[idx,1],
+                               c=_color(lab), alpha=traj_alpha, s=point_size, zorder=10)
+                    if prev_X is not None:
+                        ax.plot(np.vstack([prev_X[idx,0], X_now_red[idx,0]]),
+                                np.vstack([prev_X[idx,1], X_now_red[idx,1]]),
+                                color=_color(lab), alpha=line_alpha, linewidth=line_width, zorder=9)
+            # unselected dim gray (unless hidden)
+            if not hide_unselected:
+                unsel_mask = ~sel_mask
+                if np.any(unsel_mask):
+                    ax.scatter(X_now_red[unsel_mask,0], X_now_red[unsel_mask,1],
+                               color='lightgray', alpha=traj_gray_alpha, s=point_size, zorder=6)
+
+        prev_X = X_now_red
+
+    ax.set_xlabel("PC 1", fontsize=24)
+    ax.set_ylabel("PC 2", fontsize=24)
+    ax.tick_params(axis='both', which='major', labelsize=24)
+    ax.set_title("")
+
+    if output_file:
+        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+        print(f"Static cluster plot (target, selected clones) saved to {output_file}")
+    plt.close(fig)
+
+    # Return final-frame labels (useful downstream)
+    return labels_final
+
+
+def generate_static_cluster_plot_target_LARRY_benchmark_fate(
+    pca,
+    source_t, target_t, X1_trpts, mats, optimal_k, start_i, index, p,
+    reverse=False, intermediate_t=[1,2,3], d_red=2, random_state=42,
+    exp_memo='experiment', output_file=None,
+    meta=None,                      # metadata DataFrame
+    background_alpha=0.18,          # lighter background
+    traj_alpha=0.90,                # alpha for Monocyte/Neutrophil trajectories
+    other_traj_alpha=0.45,          # alpha for "Other" trajectories (more transparent)
+    line_alpha_main=0.55,           # connector alpha for Monocyte/Neutrophil
+    line_alpha_other=0.35,          # connector alpha for "Other"
+    # --- NEW: optional day-2 highlighting (adds marks; no trajectory changes) ---
+    day2_df=None,                   # DataFrame aligned BY ORDER to day-2 cells
+    day2_fate_col="fate",           # column in day2_df to select who to mark
+    highlight_fates=("Monocyte","Neutrophil"),
+    cross_size=36, cross_lw=1.6, cross_alpha=0.95,
+    cross_colors=None               # e.g. {"Monocyte":"#123b6d","Neutrophil":"#8b2e00"}
+):
+    import os
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    if meta is None:
+        raise ValueError("Please pass `meta` (with 'Developmental time point' and 'Cell type annotation').")
+
+    def _col(df, name):
+        candidates = {
+            "Time point": [
+                "Time point"
+            ],
+            "Cell type annotation": [
+                "Cell type annotation","Cell type","cell_type","CellType","celltype","Annotation","annotation"
+            ],
+        }[name]
+        canon = {"".join(ch for ch in c.lower() if ch.isalnum()): c for c in df.columns}
+        for cand in candidates:
+            k = "".join(ch for ch in cand.lower() if ch.isalnum())
+            if k in canon:
+                return canon[k]
+        raise KeyError(f"Could not find column for {name} in meta.")
+
+    dev_col = _col(meta, "Time point")
+    ct_col  = _col(meta, "Cell type annotation")
+
+    # (not otherwise used; kept for parity)
+    dt = p['numerical_ts'][-1] / 200
+
+    # last-day data -> 2D space
+    last_day_gene     = mats[target_t]
+    last_day_reduced  = pca.transform(last_day_gene).astype(np.float32)
+
+    # meta mask for last day == 6
+    dev_series = meta[dev_col].astype(str)
+    dev_num    = pd.to_numeric(dev_series.str.extract(r"(-?\d+\.?\d*)")[0], errors="coerce")
+    last_mask  = (dev_num == 6) if not dev_num.isna().all() else (dev_series == "6")
+
+    meta_last = meta.loc[last_mask]
+    n_meta_last = len(meta_last)
+    n_last_day  = last_day_reduced.shape[0]
+    if n_meta_last != n_last_day:
+        n_min = min(n_meta_last, n_last_day)
+        print(f"Warning: last-day meta rows ({n_meta_last}) != mats[{target_t}] rows ({n_last_day}). "
+              f"Proceeding with first {n_min} rows by position.")
+        last_day_reduced = last_day_reduced[:n_min, :]
+        meta_last = meta_last.iloc[:n_min, :]
+
+    # group mapping: 0=Monocyte, 1=Neutrophil, 2=Other
+    ct_lower = meta_last[ct_col].astype(str).str.lower()
+    def _map_group(x: str) -> int:
+        if "monocyt" in x:   return 0
+        if "neutro"  in x:   return 1
+        return 2
+    last_day_labels = np.array([_map_group(x) for x in ct_lower], dtype=int)
+
+    present = np.unique(last_day_labels)
+    centroids = {g: last_day_reduced[last_day_labels == g].mean(axis=0) for g in present}
+    present_sorted = sorted(present.tolist())  # e.g., [0,1,2] if all present
+
+    # label FINAL predicted state by nearest centroid
+    X1_hat_last = X1_trpts[-1].astype(np.float32)
+    C = np.stack([centroids[g] for g in present], axis=0)
+    dists = ((X1_hat_last[:, None, :] - C[None, :, :])**2).sum(axis=2)
+    nearest_idx = dists.argmin(axis=1)
+    map_back = np.array(present)
+    X1_hat_labels = map_back[nearest_idx]
+
+    # colors per group
+    default_colors = {0: '#1f77b4', 1: '#ff7f0e', 2: '#2ca02c'}  # blue, orange, green
+    subgroup_colors = {g: default_colors.get(g, 'gray') for g in present_sorted}
+
+    # alpha and zorder per group
+    alpha_point_by_group = {0: traj_alpha, 1: traj_alpha, 2: other_traj_alpha}
+    alpha_line_by_group  = {0: line_alpha_main, 1: line_alpha_main, 2: line_alpha_other}
+    zorder_by_group      = {0: 5, 1: 5, 2: 3}   # Monocyte/Neutrophil on top of Other
+
+    # draw OTHER first, then Mono/Neutrophil
+    group_plot_order = []
+    if 2 in present_sorted: group_plot_order.append(2)
+    group_plot_order += [g for g in present_sorted if g in (0,1)]
+
+    # =================== plotting ===================
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    # faint gray backgrounds
+    X2_vis = pca.transform(mats[target_t])
+    ax.scatter(X2_vis[:, 0], X2_vis[:, 1], color='lightgray',
+               alpha=background_alpha, s=10, zorder=1, label='Data')
+
+    for i, X1_trpt in enumerate(X1_trpts):
+        if i % index == 0 and i >= start_i:
+            if np.isnan(X1_trpt).any():
+                continue
+            X1_hat_vis = X1_trpt  # 2D already
+
+            # draw groups in the chosen order
+            for g in group_plot_order:
+                idx = (X1_hat_labels == g)
+                ax.scatter(
+                    X1_hat_vis[idx, 0], X1_hat_vis[idx, 1],
+                    c=subgroup_colors[g],
+                    alpha=alpha_point_by_group[g],
+                    s=5,
+                    zorder=zorder_by_group[g],
+                    label=f'Predicted Subtrajectory {g+1}' if i == start_i else None
+                )
+                if i > start_i:
+                    prev_X1_hat_vis = X1_trpts[i - index]
+                    prev_idx = (X1_hat_labels == g)
+                    ax.plot(
+                        [prev_X1_hat_vis[prev_idx, 0], X1_hat_vis[idx, 0]],
+                        [prev_X1_hat_vis[prev_idx, 1], X1_hat_vis[idx, 1]],
+                        color=subgroup_colors[g],
+                        alpha=alpha_line_by_group[g],
+                        linewidth=1,
+                        zorder=zorder_by_group[g] - 1
+                    )
+
+    # source & intermediates in faint gray
+    X1_vis = pca.transform(mats[source_t])
+    ax.scatter(X1_vis[:, 0], X1_vis[:, 1],
+               color='lightgray', alpha=background_alpha, s=10, zorder=1)
+    for t in intermediate_t:
+        X_intermediate_vis = pca.transform(mats[t])
+        ax.scatter(X_intermediate_vis[:, 0], X_intermediate_vis[:, 1],
+                   color='lightgray', alpha=background_alpha, s=10, zorder=1)
+
+    # ====== NEW: overlay crosses at day-2 for selected cells, matched by ORDER ======
+    if day2_df is not None:
+        if day2_fate_col not in day2_df.columns:
+            raise ValueError(f"`day2_df` must contain column '{day2_fate_col}'.")
+        # align by order to day-2 (source) cells
+        n_src = X1_vis.shape[0]
+        f = day2_df[day2_fate_col].astype("string").fillna("Unknown")
+        m = min(len(f), n_src)
+        if len(f) != n_src:
+            print(f"Note: day2_df rows ({len(f)}) != #source day cells ({n_src}); using first {m} rows by order.")
+        fate_vals = f.iloc[:m].to_numpy()
+
+        # default cross colors if none provided
+        if cross_colors is None:
+            cross_colors = {"Monocyte":"#123b6d","Neutrophil":"#8b2e00"}
+
+        # draw crosses per fate name requested
+        for fate_name in highlight_fates:
+            mask = (fate_vals == fate_name)
+            if m < n_src:  # pad to match length if needed
+                pad = np.zeros(n_src - m, dtype=bool)
+                mask = np.concatenate([mask, pad])
+            if np.any(mask):
+                ax.scatter(
+                    X1_vis[mask, 0], X1_vis[mask, 1],
+                    marker='x', s=cross_size, linewidths=cross_lw,
+                    c=cross_colors.get(fate_name, "black"),
+                    alpha=cross_alpha, zorder=8, label=None
+                )
+    # ====== end NEW ======
+
+    ax.set_xlabel("PC 1", fontsize=24)
+    ax.set_ylabel("PC 2", fontsize=24)
+    ax.tick_params(axis='both', which='major', labelsize=24)
+    ax.set_title("")
+
+    if output_file is None:
+        output_file = f"{exp_memo}_static_target.png"
+    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"Static cluster plot saved to {output_file}")
+    plt.close(fig)
+
+    return X1_hat_labels
+
+
+def generate_static_trajectory_plots_two_timepoints(pca,physical_dt,days, intermediate_days, X1_trpts, mats, d_red=26, output_file_with_snapshots=None, output_file_without_snapshots=None, output_file_snapshots_only=None):
+    """
+    Generate two static trajectory plots:
+    1. With snapshots from X1_trpts using a color gradient.
+    2. Without snapshots, showing only main time points.
+    """
+
+    
+    # Define color gradient for snapshots
+    num_snapshots = len(X1_trpts)
+    colormap = cm.viridis  # Can change to "plasma", "inferno", etc.
+    snapshot_colors = [colormap(i / num_snapshots) for i in range(num_snapshots)]
+
+    # Rescale time values for the color bar
+    time_values = np.linspace(0, physical_dt * num_snapshots, num_snapshots)
+
+    # Create a normalization object for the color mapping
+    norm = mcolors.Normalize(vmin=time_values.min(), vmax=time_values.max())
+    sm = cm.ScalarMappable(cmap=colormap, norm=norm)
+    sm.set_array([])  # Needed for color bar
+
+   
+    source_t = days[0]
+  
+    target_t = days[1]
+    # target_t = 4
+    # Define colors for time points
+    color_map = {
+        source_t: '#1f77b4',  # Blue
+        intermediate_days[0]: '#ff7f0e',  # Orange
+        target_t: '#d62728'  # Red
+    }
+
+    # **Plot 1: With Snapshots**
+    fig1, ax1 = plt.subplots(figsize=(8, 6))
+
+    # Plot source, intermediates, and target
+    X1_vis = pca.transform(mats[source_t])
+    #Xm_vis = pca.transform(mats[middle_t])
+    X2_vis = pca.transform(mats[target_t])
+    #ax1.scatter(X1_vis[:, 0], X1_vis[:, 1], facecolors='none', edgecolors=color_map[source_t], linewidths=0.5, alpha=1.0, s=20, zorder=10, label=f'Time {source_t}')
+    #ax1.scatter(X2_vis[:, 0], X2_vis[:, 1], facecolors='none', edgecolors=color_map[target_t], linewidths=0.5, alpha=1.0, s=20, zorder=10, label=f'Time {target_t}')
+
+
+    # Plot intermediate time points
+    for t in intermediate_days:
+        X_intermediate_vis = pca.transform(mats[t])
+        ax1.scatter(X_intermediate_vis[:, 0], X_intermediate_vis[:, 1], color=color_map[t], facecolors='none', edgecolors=color_map[t], linewidths=1.0, alpha=0.75, s=10, zorder = 20,  label=f'Day {t} (Test Data)')
+
+    # Plot snapshots from X1_trpts with a color gradient
+    for i, X1_trpt in enumerate(X1_trpts):
+        if np.isnan(X1_trpt).any():
+            continue
+        X1_hat_vis = X1_trpt
+        ax1.scatter(X1_hat_vis[:, 0], X1_hat_vis[:, 1], color=snapshot_colors[i], alpha=0.75, s=2, zorder = 1)
+
+    # Add a small color bar inside the plot
+    cax = ax1.inset_axes([1.02, 0.2, 0.03, 0.6])  # [x, y, width, height] (relative position)
+    
+    # Create the colorbar with increased size
+    cbar = plt.colorbar(sm, cax=cax)
+    
+    # Set manual tick positions
+    cbar.set_ticks(np.linspace(0, 4, 5))  # Ensures ticks at 0, 1, 2, 3, 4
+    
+    # Optional: Explicitly set tick labels if needed
+    cbar.set_ticklabels([0, 1, 2, 3, 4])  
+    
+    # Increase colorbar label font size
+    cbar.set_label("Time", fontsize=20)  
+    
+    # Increase colorbar tick font size
+    cbar.ax.tick_params(labelsize=20)
+
+    # Adjust colorbar thickness
+    #cbar.ax.set_aspect(20)  # Increase aspect ratio to make it thicker
+   
+    # Set labels and title
+    ax1.set_xlabel("PC 1", fontsize = 20)
+    ax1.set_ylabel("PC 2", fontsize = 20)
+    ax1.tick_params(axis='both', which='major', labelsize=20)  # Increase tick sizes
+    #ax1.legend(loc='upper right', fontsize= 24)
+    ax1.set_title("")
+
+    # Save or show the plot
+    if output_file_with_snapshots:
+        plt.savefig(output_file_with_snapshots, dpi=300, bbox_inches='tight')
+        print(f"Static trajectory plot WITH snapshots saved to {output_file_with_snapshots}")
+        plt.close(fig1)
+    else:
+        plt.show()
+
+    # **Plot 2: Without Snapshots**
+    fig2, ax2 = plt.subplots(figsize=(8, 6))
+
+    # Plot only source, intermediates, and target
+    ax2.scatter(X1_vis[:, 0], X1_vis[:, 1], color=color_map[source_t], alpha=1.0, s=8,  zorder = 15, label=f'Time {source_t} (Training Data)')
+    #ax2.scatter(Xm_vis[:, 0], Xm_vis[:, 1], color=color_map[middle_t], alpha=1.0, s=10,  zorder = 10, label=f'Time {middle_t}')
+    ax2.scatter(X2_vis[:, 0], X2_vis[:, 1], color=color_map[target_t], alpha=1.0, s=8,  zorder = 10, label=f'Time {target_t} (Training Data)')
+
+    # Set labels and title
+    ax2.set_xlabel("PC 1", fontsize = 20)
+    ax2.set_ylabel("PC 2", fontsize = 20)
+    ax2.tick_params(axis='both', which='major', labelsize=20)  # Increase tick sizes
+    #ax2.legend(loc='upper right', fontsize='small')
+    ax2.set_title("")
+
+    # Save or show the plot
+    if output_file_without_snapshots:
+        plt.savefig(output_file_without_snapshots, dpi=300, bbox_inches='tight')
+        print(f"Static trajectory plot WITHOUT snapshots saved to {output_file_without_snapshots}")
+        plt.close(fig2)
+    else:
+        plt.show()
+
+
+## Static plot function for simple GPA (breast cancer cell line data)
+
+def generate_static_trajectory_plots_two_timepoints_no_middle(pca,physical_dt,days, intermediate_days, X1_trpts, mats, d_red=26, output_file_with_snapshots=None, output_file_without_snapshots=None, output_file_snapshots_only=None):
+    """
+    Generate two static trajectory plots:
+    1. With snapshots from X1_trpts using a color gradient.
+    2. Without snapshots, showing only main time points.
+    """
+    
+
+    # Define color gradient for snapshots
+    num_snapshots = len(X1_trpts)
+    colormap = cm.viridis  # Can change to "plasma", "inferno", etc.
+    snapshot_colors = [colormap(i / num_snapshots) for i in range(num_snapshots)]
+
+    # Rescale time values for the color bar
+    time_values = np.linspace(0, physical_dt * num_snapshots, num_snapshots)
+
+    # Create a normalization object for the color mapping
+    norm = mcolors.Normalize(vmin=time_values.min(), vmax=time_values.max())
+    sm = cm.ScalarMappable(cmap=colormap, norm=norm)
+    sm.set_array([])  # Needed for color bar
+
+    source_t, middle_t, target_t = days[0], days[1], days[-1]
+    
+    # Define colors for time points
+    color_map = {
+        source_t: '#1f77b4',  # Blue
+        #intermediate_days[0]: '#ff7f0e',  # Orange
+        target_t: '#d62728'  # Red
+    }
+
+    # **Plot 1: With Snapshots**
+    fig1, ax1 = plt.subplots(figsize=(8, 6))
+
+    # Plot source, intermediates, and target
+    X1_vis = pca.transform(mats[source_t])
+    #Xm_vis = pca.transform(mats[middle_t])
+    X2_vis = pca.transform(mats[target_t])
+    #ax1.scatter(X1_vis[:, 0], X1_vis[:, 1], facecolors='none', edgecolors=color_map[source_t], linewidths=0.5, alpha=1.0, s=20, zorder=10, label=f'Time {source_t}')
+    #ax1.scatter(X2_vis[:, 0], X2_vis[:, 1], facecolors='none', edgecolors=color_map[target_t], linewidths=0.5, alpha=1.0, s=20, zorder=10, label=f'Time {target_t}')
+
+
+
+    # Plot snapshots from X1_trpts with a color gradient
+    for i, X1_trpt in enumerate(X1_trpts):
+        if np.isnan(X1_trpt).any():
+            continue
+        X1_hat_vis = X1_trpt
+        ax1.scatter(X1_hat_vis[:, 0], X1_hat_vis[:, 1], color=snapshot_colors[i], alpha=0.75, s=2, zorder = 1)
+
+    # sort & coerce to ints for discrete ticks like 2,3,4
+    d0, d1 = sorted(map(int, days))
+
+    # make sure the color scale matches the requested day range
+    if hasattr(sm, "set_clim"):
+        sm.set_clim(d0, d1)
+    else:
+        sm.norm.vmin, sm.norm.vmax = d0, d1
+
+    # create the inset colorbar
+    cax = ax1.inset_axes([1.02, 0.2, 0.03, 0.6])
+    cbar = plt.colorbar(sm, cax=cax)
+
+    # ticks from start to end (inclusive): e.g., [2, 3, 4]
+    ticks = np.arange(d0, d1 + 1)
+    cbar.set_ticks(ticks)
+    cbar.set_ticklabels([str(t) for t in ticks])
+
+    # styling
+    cbar.set_label("Time", fontsize=20)
+    cbar.ax.tick_params(labelsize=20)
+
+    # Adjust colorbar thickness
+    #cbar.ax.set_aspect(20)  # Increase aspect ratio to make it thicker
+   
+    # Set labels and title
+    ax1.set_xlabel("PC 1", fontsize = 20)
+    ax1.set_ylabel("PC 2", fontsize = 20)
+    ax1.tick_params(axis='both', which='major', labelsize=20)  # Increase tick sizes
+    #ax1.legend(loc='upper right', fontsize= 24)
+    ax1.set_title("")
+
+    # Save or show the plot
+    if output_file_with_snapshots:
+        plt.savefig(output_file_with_snapshots, dpi=300, bbox_inches='tight')
+        print(f"Static trajectory plot WITH snapshots saved to {output_file_with_snapshots}")
+        plt.close(fig1)
+    else:
+        plt.show()
+
+    # **Plot 2: Without Snapshots**
+    fig2, ax2 = plt.subplots(figsize=(8, 6))
+
+    # Plot only source, intermediates, and target
+    ax2.scatter(X1_vis[:, 0], X1_vis[:, 1], color=color_map[source_t], alpha=1.0, s=8,  zorder = 15, label=f'Time {source_t} (Training Data)')
+    #ax2.scatter(Xm_vis[:, 0], Xm_vis[:, 1], color=color_map[middle_t], alpha=1.0, s=10,  zorder = 10, label=f'Time {middle_t}')
+    ax2.scatter(X2_vis[:, 0], X2_vis[:, 1], color=color_map[target_t], alpha=1.0, s=8,  zorder = 10, label=f'Time {target_t} (Training Data)')
+
+    # Set labels and title
+    ax2.set_xlabel("PC 1", fontsize = 20)
+    ax2.set_ylabel("PC 2", fontsize = 20)
+    ax2.tick_params(axis='both', which='major', labelsize=20)  # Increase tick sizes
+    #ax2.legend(loc='upper right', fontsize='small')
+    ax2.set_title("")
+
+    # Save or show the plot
+    if output_file_without_snapshots:
+        plt.savefig(output_file_without_snapshots, dpi=300, bbox_inches='tight')
+        print(f"Static trajectory plot WITHOUT snapshots saved to {output_file_without_snapshots}")
+        plt.close(fig2)
+    else:
+        plt.show()
+
+
+def classify_X2_hat(
+    full_matrix,pca,source_t, target_t,X1_trpts,mats, optimal_k, start_i, index,p, reverse=True, intermediate_t=[1], 
+    d_red=2, random_state=42, exp_memo='2', output_file = None,output_file_2 = None):
+    
+   
+
+    dt = p['numerical_ts'][-1] / 200
+   
+    physical_dt = dt * p['ts'][-1] / p['numerical_ts'][-1]
+
+    intermediate_t = np.array(intermediate_t)
+    if len(intermediate_t) == 0:
+        intermediate_t = range(source_t+1, target_t)
+
+    day1, day2 = source_t, target_t
+
+    # Perform clustering analysis on the last day's cell states
+    last_day = mats[day1]
+    last_day_reduced = pca.transform(last_day).astype(np.float32)
+
+    kmeans = KMeans(n_clusters=optimal_k, random_state=42)
+    kmeans.fit(last_day_reduced)
+    last_day_labels = kmeans.labels_
+
+    X1_hat_last = X1_trpts[0].astype(np.float32)
+    X1_hat_labels = kmeans.predict(X1_hat_last)
+
+    # Generate colors for clusters
+    default_colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown']
+    viridis_colors = default_colors[:optimal_k]
+
+    def get_subgroup_colors(labels, colors):
+        unique_labels = np.unique(labels)
+        subgroup_colors = {label: colors[i] for i, label in enumerate(unique_labels)}
+        return subgroup_colors
+
+    subgroup_colors_blue = get_subgroup_colors(X1_hat_labels, viridis_colors)
+    subgroup_colors_red = get_subgroup_colors(last_day_labels, viridis_colors)
+
+    # Define filename paths
+    direction = 'backward' if reverse else 'forward'
+    img_src = output_file
+    initial_img_src = output_file_2
+    
+    # Plot initial state for animation
+    fig, ax = plt.subplots()
+    ims = []
+
+    reducer = decomposition.PCA(n_components=2, random_state=0)
+    reducer.fit(full_matrix)
+    vis_all_days = reducer.transform(full_matrix)
+    # Prepare Data for Initial State
+    X1_vis = reducer.transform(mats[day1])
+    X2_vis = reducer.transform(mats[day2])
+
+    # **(1) Save the Initial State Figure with Black Circle Outlines**
+    fig_init, ax_init = plt.subplots(figsize=(8, 6))
+    
+    # Plot background gray cells
+    ax_init.scatter(vis_all_days[:, 0], vis_all_days[:, 1], color='lightgray', alpha=1.0, s=8.0, zorder=5)
+    
+    # Plot last day's clusters **with black outline**
+    scatter = ax_init.scatter(X1_vis[:, 0], X1_vis[:, 1], 
+                              c=[subgroup_colors_red[label] for label in last_day_labels], 
+                              alpha=1.0, s=50, edgecolors='black', linewidth=1.5, zorder=8)
+    
+    # Axis Labels
+    ax_init.set_xlabel("PC 1", fontsize=24)
+    ax_init.set_ylabel("PC 2", fontsize=24)
+    ax_init.tick_params(axis='both', which='major', labelsize=24)
+    ax_init.set_title("", fontsize=16)
+    
+    # Save the static figure
+    plt.savefig(initial_img_src, dpi=300, bbox_inches="tight")
+    plt.close()
+    
+
+    # **(2) Create a Separate Figure for the Legend**
+    fig_legend, ax_legend = plt.subplots(figsize=(10, 2))  # Wider aspect ratio for horizontal layout
+    ax_legend.axis("off")  # Hide axes
+    
+    # Get unique labels
+    unique_labels = np.unique(last_day_labels)
+    
+    # Define legend elements:
+    legend_elements = []
+    
+    # (A) **Fate Labels (Bold Dots with Black Outlines)**
+    for i, label in enumerate(unique_labels):
+        legend_elements.append(
+            mlines.Line2D([], [], color=subgroup_colors_red[label], marker='o', linestyle='None', markersize=12, 
+                          markeredgecolor='black', markeredgewidth=3.0, label=f"Ancestor {i+1}")
+        )
+    
+    # (B) **Predicted Trajectories (One Dot with a Centered Horizontal Bar)**
+    for i, label in enumerate(unique_labels):
+        # Single dot with a horizontal bar
+        trajectory_dot_bar = mlines.Line2D([], [], color=subgroup_colors_red[label], marker='o', linestyle='-', 
+                                           markersize=6, linewidth=2, alpha=1.0, label=f"Trajectory {i+1}")
+    
+        # Add to legend
+        legend_elements.append(trajectory_dot_bar)
+    
+    # Create horizontal legend **with a frame**
+    ax_legend.legend(
+        handles=legend_elements,
+        loc="center", fontsize=20, title="Cell Ancestors & Predicted Trajectories",
+        title_fontsize=20, ncol=4, frameon=True, framealpha=1.0, edgecolor="black", handletextpad=1.0, columnspacing=1.0
+    )
+    
+    # Save the legend figure
+    legend_img_src = initial_img_src.replace(".png", "_legend.png")
+    plt.savefig(legend_img_src, dpi=300, bbox_inches="tight")
+    plt.close()
+    
+
+
+    # Animation: Initial frame
+    im = ax.scatter(X1_vis[:, 0], X1_vis[:, 1], 
+                    c=[subgroup_colors_red[label] for label in last_day_labels], 
+                    alpha=1.0, s=3.0, zorder=8)
+
+    ttl = ax.text(0.5, 1.05, "t = %.3f" % (0), 
+                  bbox={'facecolor': 'w', 'alpha': 0.5, 'pad': 5}, 
+                  transform=ax.transAxes, ha="center")
+
+    ims.append([im, ttl])
+
+    # Animation: Trajectory updates
+    indices = range(len(X1_trpts) - start_i)
+    if reverse:
+        indices = reversed(indices)
+
+    for i in indices:
+        if i % index == 0:
+            X1_trpt = X1_trpts[i]
+            if np.isnan(X1_trpt).any():
+                break
+            X1_hat = pca.inverse_transform(X1_trpt)
+            X1_hat_vis = reducer.transform(X1_hat)
+
+            im = ax.scatter(X1_hat_vis[:, 0], X1_hat_vis[:, 1], 
+                            c=[subgroup_colors_blue[label] for label in X1_hat_labels], 
+                            alpha=1.0, s=3.0, zorder=10)
             
+            ax.scatter(X1_vis[:, 0], X1_vis[:, 1], 
+                       c=[subgroup_colors_red[label] for label in last_day_labels], 
+                       alpha=1.0, s=3.0, zorder=8)
+
+            # Keep background cells in the animation
+            ax.scatter(vis_all_days[:, 0], vis_all_days[:, 1], color='lightgray', alpha=1.0, s=0.5, zorder=5)
+
+            ttl = ax.text(0.5, 1.05, "t = %.3f" % (physical_dt * i), 
+                          bbox={'facecolor': 'w', 'alpha': 0.5, 'pad': 5}, 
+                          transform=ax.transAxes, ha="center")
+
+            ims.append([im, ttl])
+
+    ani = animation.ArtistAnimation(fig, ims, interval=50, blit=True, repeat_delay=200)
+    writergif = animation.PillowWriter(fps=3)
+    ani.save(img_src, writer=writergif)
+    plt.clf()
+    
+    # Display saved animation
+    display(Image(filename=img_src))
+
+    print(f"Initial state figure (with background) saved at: {initial_img_src}")
+    print(f"Animation saved at: {img_src}")
+
+
+def classify_X1_hat(full_matrix,pca,source_t, target_t,X1_trpts,mats, optimal_k, start_i, index,p, reverse=True, intermediate_t=[1], 
+    d_red=2, random_state=42, exp_memo='2', output_file = None,output_file_2 = None):
+    
+
+    dt = p['numerical_ts'][-1] / 200
+    
+
+    physical_dt = dt * p['ts'][-1] / p['numerical_ts'][-1]
+
+    intermediate_t = np.array(intermediate_t)
+    if len(intermediate_t) == 0:
+        intermediate_t = range(source_t+1, target_t)
+
+    day1, day2 = source_t, target_t
+
+    # Perform clustering analysis on the last day's cell states
+    last_day = mats[day2]
+    last_day_reduced = pca.transform(last_day).astype(np.float32)
+
+    kmeans = KMeans(n_clusters=optimal_k, random_state=42)
+    kmeans.fit(last_day_reduced)
+    last_day_labels = kmeans.labels_
+
+    X1_hat_last = X1_trpts[-1].astype(np.float32)
+    X1_hat_labels = kmeans.predict(X1_hat_last)
+
+    # Generate colors for clusters
+    default_colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown']
+    viridis_colors = default_colors[:optimal_k]
+
+    def get_subgroup_colors(labels, colors):
+        unique_labels = np.unique(labels)
+        subgroup_colors = {label: colors[i] for i, label in enumerate(unique_labels)}
+        return subgroup_colors
+
+    subgroup_colors_blue = get_subgroup_colors(X1_hat_labels, viridis_colors)
+    subgroup_colors_red = get_subgroup_colors(last_day_labels, viridis_colors)
+
+    # Define filename paths
+    direction = 'backward' if reverse else 'forward'
+    img_src = output_file
+    initial_img_src = output_file_2
+    # img_src = f"{output_dir}{exp_memo}-movie-cluster-{optimal_k}-{direction}-trajectory.gif"
+    # initial_img_src = os.path.join(output_dir, f"{exp_memo}_initial_state_with_background.png")  # NEW STATIC FIGURE
+
+    # Plot initial state for animation
+    fig, ax = plt.subplots()
+    ims = []
+
+    # Prepare Data for Initial State
+    reducer = decomposition.PCA(n_components=2, random_state=0)
+    reducer.fit(full_matrix)
+    vis_all_days = reducer.transform(full_matrix)
+    
+    X1_vis = reducer.transform(mats[day1])
+    X2_vis = reducer.transform(mats[day2])
+
+    # **(1) Save the Initial State Figure with Black Circle Outlines**
+    fig_init, ax_init = plt.subplots(figsize=(8, 6))
+    
+    # Plot background gray cells
+    ax_init.scatter(vis_all_days[:, 0], vis_all_days[:, 1], color='lightgray', alpha=1.0, s=8.0, zorder=5)
+    
+    # Plot last day's clusters **with black outline**
+    scatter = ax_init.scatter(X2_vis[:, 0], X2_vis[:, 1], 
+                              c=[subgroup_colors_red[label] for label in last_day_labels], 
+                              alpha=1.0, s=50, edgecolors='black', linewidth=1.5, zorder=8)
+    
+    # Axis Labels
+    ax_init.set_xlabel("PC 1", fontsize=24)
+    ax_init.set_ylabel("PC 2", fontsize=24)
+    ax_init.tick_params(axis='both', which='major', labelsize=24)
+    ax_init.set_title("", fontsize=16)
+    
+    # Save the static figure
+    plt.savefig(initial_img_src, dpi=300, bbox_inches="tight")
+    plt.close()
+    
+
+    # **(2) Create a Separate Figure for the Legend**
+    fig_legend, ax_legend = plt.subplots(figsize=(10, 2))  # Wider aspect ratio for horizontal layout
+    ax_legend.axis("off")  # Hide axes
+    
+    # Get unique labels
+    unique_labels = np.unique(last_day_labels)
+    
+    # Define legend elements:
+    legend_elements = []
+    
+    # (A) **Fate Labels (Bold Dots with Black Outlines)**
+    for i, label in enumerate(unique_labels):
+        legend_elements.append(
+            mlines.Line2D([], [], color=subgroup_colors_red[label], marker='o', linestyle='None', markersize=12, 
+                          markeredgecolor='black', markeredgewidth=3.0, label=f"Fate {i+1}")
+        )
+    
+    # (B) **Predicted Trajectories (One Dot with a Centered Horizontal Bar)**
+    for i, label in enumerate(unique_labels):
+        # Single dot with a horizontal bar
+        trajectory_dot_bar = mlines.Line2D([], [], color=subgroup_colors_red[label], marker='o', linestyle='-', 
+                                           markersize=6, linewidth=2, alpha=1.0, label=f"Trajectory {i+1}")
+    
+        # Add to legend
+        legend_elements.append(trajectory_dot_bar)
+    
+    # Create horizontal legend **with a frame**
+    ax_legend.legend(
+        handles=legend_elements,
+        loc="center", fontsize=20, title="Cell Fates & Predicted Trajectories",
+        title_fontsize=20, ncol=4, frameon=True, framealpha=1.0, edgecolor="black", handletextpad=1.0, columnspacing=1.0
+    )
+    
+    # Save the legend figure
+    legend_img_src = initial_img_src.replace(".png", "_legend.png")
+    plt.savefig(legend_img_src, dpi=300, bbox_inches="tight")
+    plt.close()
+    
+
+
+    # Animation: Initial frame
+    im = ax.scatter(X2_vis[:, 0], X2_vis[:, 1], 
+                    c=[subgroup_colors_red[label] for label in last_day_labels], 
+                    alpha=1.0, s=3.0, zorder=8)
+
+    ttl = ax.text(0.5, 1.05, "t = %.3f" % (0), 
+                  bbox={'facecolor': 'w', 'alpha': 0.5, 'pad': 5}, 
+                  transform=ax.transAxes, ha="center")
+
+    ims.append([im, ttl])
+
+    # Animation: Trajectory updates
+    indices = range(len(X1_trpts) - start_i)
+    if reverse:
+        indices = reversed(indices)
+
+    for i in indices:
+        if i % index == 0:
+            X1_trpt = X1_trpts[i]
+            if np.isnan(X1_trpt).any():
+                break
+            X1_hat = pca.inverse_transform(X1_trpt)
+            X1_hat_vis = reducer.transform(X1_hat)
+
+            im = ax.scatter(X1_hat_vis[:, 0], X1_hat_vis[:, 1], 
+                            c=[subgroup_colors_blue[label] for label in X1_hat_labels], 
+                            alpha=1.0, s=3.0, zorder=10)
+            
+            ax.scatter(X2_vis[:, 0], X2_vis[:, 1], 
+                       c=[subgroup_colors_red[label] for label in last_day_labels], 
+                       alpha=1.0, s=3.0, zorder=8)
+
+            # Keep background cells in the animation
+            ax.scatter(vis_all_days[:, 0], vis_all_days[:, 1], color='lightgray', alpha=1.0, s=0.5, zorder=5)
+
+            ttl = ax.text(0.5, 1.05, "t = %.3f" % (physical_dt * i), 
+                          bbox={'facecolor': 'w', 'alpha': 0.5, 'pad': 5}, 
+                          transform=ax.transAxes, ha="center")
+
+            ims.append([im, ttl])
+
+    ani = animation.ArtistAnimation(fig, ims, interval=50, blit=True, repeat_delay=200)
+    writergif = animation.PillowWriter(fps=3)
+    ani.save(img_src, writer=writergif)
+    plt.clf()
+    
+    # Display saved animation
+    display(Image(filename=img_src))
+
+    print(f"Initial state figure (with background) saved at: {initial_img_src}")
+    print(f"Animation saved at: {img_src}")
+
+
+def generate_static_cluster_plot_source(
+    pca,
+    source_t, target_t, X1_trpts, mats, optimal_k, start_i, index,p, reverse=False, intermediate_t=[1,2,3], 
+    d_red=2, random_state=42, exp_memo='experiment', output_file = None
+):
+    """
+    Generate a static plot of all snapshots from X1_trpts, colored by sub-trajectories.
+    
+    Parameters:
+    - pca - a two dimensional pca
+    - source_t (int): Source time step.
+    - target_t (int): Target time step.
+    - X1_trpts: list of cell positions over time generated by velocity field
+    - Mats:  dictionary that groups gene expression data by timepoint.
+    - optimal_k (int): Number of clusters.
+    - start_i (int): Starting index for X1_trpts.
+    - index (int): Step size for selecting snapshots.
+    -p: velocity model parameters
+    - reverse (bool): Whether to reverse trajectory direction.
+    - intermediate_t (list): List of intermediate time points.
+    - d_red (int): PCA dimension reduction.
+    - random_state (int): Random seed for clustering.
+    - exp_memo (str): Experiment identifier for file naming.
+    - output_file: The output filepath for the graph
+    """
+    
+
+    # Compute trajectory integration
+    dt = p['numerical_ts'][-1] / 200
+   
+    # Perform clustering on last day's cell states
+    last_day = mats[source_t]
+    last_day_reduced = pca.transform(last_day).astype(np.float32)
+    
+    kmeans = KMeans(n_clusters=optimal_k, random_state=random_state)
+    kmeans.fit(last_day_reduced)
+    last_day_labels = kmeans.labels_
+
+    # Classify final predicted states
+    X1_hat_last = X1_trpts[0].astype(np.float32)
+    X1_hat_labels = kmeans.predict(X1_hat_last)
+
+    # Define colors for each cluster
+    default_colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown']
+    subgroup_colors_blue = {label: default_colors[i] for i, label in enumerate(np.unique(X1_hat_labels))}
+    subgroup_colors_red = {label: default_colors[i] for i, label in enumerate(np.unique(last_day_labels))}
+
+
+    # Create figure
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    # Plot last day's clusters (target) in red subgroup colors
+   # Plot last day's clusters (target) in gray as actual data
+    X2_vis = pca.transform(mats[target_t])
+    ax.scatter(X2_vis[:, 0], X2_vis[:, 1], facecolors='none', edgecolors='gray', linewidths=0.7, alpha=0.7, s=10, zorder=10, label='Data')
+
+
+    # Plot transported states (X1_hat) using assigned cluster colors (predicted sub-trajectories)
+    for i, X1_trpt in enumerate(X1_trpts):
+        if i % index == 0 and i >= start_i:
+            if np.isnan(X1_trpt).any():
+                continue
+            X1_hat_vis = X1_trpt
+            for label in np.unique(X1_hat_labels):
+                idx = (X1_hat_labels == label)
+                ax.scatter(X1_hat_vis[idx, 0], X1_hat_vis[idx, 1],
+                           c=subgroup_colors_blue[label], alpha=0.75, s=3, zorder=1,
+                           label=f'Predicted Subtrajectory {label+1}' if i == start_i else None) 
+                
+
+    # Plot source day
+    X1_vis = pca.transform(mats[source_t])
+    ax.scatter(X1_vis[:, 0], X1_vis[:, 1], facecolors='none', edgecolors='gray', linewidths=0.7,  alpha=0.7, s=10, zorder = 10, label=f'Source: Day {source_t}')
+
+    # Plot intermediate time points
+    for t in intermediate_t:
+        X_intermediate_vis = pca.transform(mats[t])
+        ax.scatter(X_intermediate_vis[:, 0], X_intermediate_vis[:, 1], facecolors='none', edgecolors='gray', linewidths=0.7,  alpha=0.7, s=10, zorder = 10, label=f'Intermediate: Day {t}')
+
+    # Set labels, legend, and title
+    ax.set_xlabel("PC 1", fontsize = 24)
+    ax.set_ylabel("PC 2", fontsize = 24)
+    ax.tick_params(axis='both', which='major', labelsize=24)  # Increases tick font size
+    ax.set_title("")
+
+    # Save or show the plot
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"Static cluster plot saved to {output_file}")
+    plt.close(fig)
+
+    return X1_hat_labels
+
+
+def generate_static_cluster_plot_target(pca,
+    source_t, target_t, X1_trpts, mats, optimal_k, start_i, index,p, reverse=False, intermediate_t=[1,2,3], 
+    d_red=2, random_state=42, exp_memo='experiment', output_file = None
+):
+    """
+    Generate a static plot of all snapshots from X1_trpts, colored by sub-trajectories.
+    
+    Parameters:
+    - pca - a two dimensional pca
+    - source_t (int): Source time step.
+    - target_t (int): Target time step.
+    - X1_trpts: list of cell positions over time generated by velocity field
+    - Mats:  dictionary that groups gene expression data by timepoint.
+    - optimal_k (int): Number of clusters.
+    - start_i (int): Starting index for X1_trpts.
+    - index (int): Step size for selecting snapshots.
+    -p: velocity model parameters
+    - reverse (bool): Whether to reverse trajectory direction.
+    - intermediate_t (list): List of intermediate time points.
+    - d_red (int): PCA dimension reduction.
+    - random_state (int): Random seed for clustering.
+    - exp_memo (str): Experiment identifier for file naming.
+    - output_file: The output filepath for the graph
+    """
+    
+    
+
+    # Compute trajectory integration
+    dt = p['numerical_ts'][-1] / 200
+    
+ 
+    # Perform clustering on last day's cell states
+    last_day = mats[target_t]
+    last_day_reduced = pca.transform(last_day).astype(np.float32)
+    
+    kmeans = KMeans(n_clusters=optimal_k, random_state=random_state)
+    kmeans.fit(last_day_reduced)
+    last_day_labels = kmeans.labels_
+
+    # Classify final predicted states
+    X1_hat_last = X1_trpts[-1].astype(np.float32)
+    X1_hat_labels = kmeans.predict(X1_hat_last)
+
+    # Define colors for each cluster
+    default_colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown']
+    subgroup_colors_blue = {label: default_colors[i] for i, label in enumerate(np.unique(X1_hat_labels))}
+    subgroup_colors_red = {label: default_colors[i] for i, label in enumerate(np.unique(last_day_labels))}
+
+   
+    
+
+    # Create figure
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    # Plot last day's clusters (target) in gray as actual data
+    X2_vis = pca.transform(mats[target_t])
+    ax.scatter(X2_vis[:, 0], X2_vis[:, 1], color='lightgray', alpha=0.7, s=10, zorder=10, label='Data')
+        
+    # Plot transported states (X1_hat) using assigned cluster colors (predicted sub-trajectories)
+    for i, X1_trpt in enumerate(X1_trpts):
+        if i % index == 0 and i >= start_i:
+            if np.isnan(X1_trpt).any():
+                continue
+            X1_hat_vis = X1_trpt
+    
+            for label in np.unique(X1_hat_labels):
+                idx = (X1_hat_labels == label)
+    
+                # Scatter Plot: Individual Points
+                ax.scatter(X1_hat_vis[idx, 0], X1_hat_vis[idx, 1],
+                           c=subgroup_colors_blue[label], alpha=0.75, s=3, zorder=1,
+                           label=f'Predicted Subtrajectory {label+1}' if i == start_i else None)
+    
+                # **Line Plot: Connect Points from Previous Iteration**
+                if i > start_i:  # Ensure there's a previous iteration
+                    prev_X1_hat_vis = X1_trpts[i - index]  # Get previous iteration
+                    prev_idx = (X1_hat_labels == label)
+    
+                    ax.plot([prev_X1_hat_vis[prev_idx, 0], X1_hat_vis[idx, 0]],
+                            [prev_X1_hat_vis[prev_idx, 1], X1_hat_vis[idx, 1]],
+                            color=subgroup_colors_blue[label], alpha=0.5, linewidth=1, zorder=0)
+
+    
+    # Plot source and intermediate days in gray circles (empty)
+    X1_vis = pca.transform(mats[source_t])
+    ax.scatter(X1_vis[:, 0], X1_vis[:, 1], color='lightgray', alpha=0.7, s=10, zorder=10)
+    
+    for t in intermediate_t:
+        X_intermediate_vis = pca.transform(mats[t])
+        ax.scatter(X_intermediate_vis[:, 0], X_intermediate_vis[:, 1],
+                   color='lightgray', alpha=0.7, s=10, zorder=10)
+    
+    # Set labels and title
+    ax.set_xlabel("PC 1", fontsize = 24)
+    ax.set_ylabel("PC 2", fontsize = 24)
+    ax.tick_params(axis='both', which='major', labelsize=24)  # Increases tick font size
+    ax.set_title("")
+    
+    # Add custom legend
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    #ax.legend(by_label.values(), by_label.keys(), loc='upper right', fontsize='24')
+    
+    # Save or show the plot
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"Static cluster plot saved to {output_file}")
+    plt.close(fig)
+
+
+    return X1_hat_labels
+
+def generate_static_trajectory_plots_three_timepoints(pca,physical_dt, days, intermediate_days, X1_trpts, mats, d_red=26, output_file_with_snapshots=None, output_file_without_snapshots=None):
+    """
+    Generate two static trajectory plots:
+    1. With snapshots from X1_trpts using a color gradient.
+    2. Without snapshots, showing only main time points.
+    """
+    
+    # Define color gradient for snapshots
+    num_snapshots = len(X1_trpts)
+    colormap = cm.viridis  # Can change to "plasma", "inferno", etc.
+    snapshot_colors = [colormap(i / num_snapshots) for i in range(num_snapshots)]
+
+    # Rescale time values for the color bar
+    time_values = np.linspace(0, physical_dt * num_snapshots, num_snapshots)
+
+    # Create a normalization object for the color mapping
+    norm = mcolors.Normalize(vmin=time_values.min(), vmax=time_values.max())
+    sm = cm.ScalarMappable(cmap=colormap, norm=norm)
+    sm.set_array([])  # Needed for color bar
+
+    source_t, middle_t, target_t = days[0], days[1], days[-1]
+    
+    # Define colors for time points
+    color_map = {
+        source_t: '#1f77b4',  # Blue
+        intermediate_days[0]: '#2ca02c',  # Green
+        middle_t: '#ff7f0e',  # Orange
+        intermediate_days[1]: '#8c564b',  # Brown
+        target_t: '#d62728'  # Red
+    }
+
+    # **Plot 1: With Snapshots**
+    fig1, ax1 = plt.subplots(figsize=(8, 6))
+
+    # Plot source, intermediates, and target
+    X1_vis = pca.transform(mats[source_t])
+    Xm_vis = pca.transform(mats[middle_t])
+    X2_vis = pca.transform(mats[target_t])
+    ax1.scatter(X1_vis[:, 0], X1_vis[:, 1], color=color_map[source_t], alpha=1.0, s=12, zorder = 10, label=f'Time {source_t} (Training Data)')
+    ax1.scatter(Xm_vis[:, 0], Xm_vis[:, 1], color=color_map[middle_t], alpha=1.0, s=12, zorder = 10, label=f'Time {middle_t} (Training Data)')
+    ax1.scatter(X2_vis[:, 0], X2_vis[:, 1], color=color_map[target_t], alpha=1.0, s=12, zorder = 10, label=f'Time {target_t} (Training Data)')
+
+    # Plot intermediate time points
+    for t in intermediate_days:
+        X_intermediate_vis = pca.transform(mats[t])
+        ax1.scatter(X_intermediate_vis[:, 0], X_intermediate_vis[:, 1], color=color_map[t], facecolors='none', edgecolors=color_map[t], linewidths=1.2, alpha=1.0, s=15, zorder = 20,  label=f'Time {t} (Test Data)')
+
+    # Plot snapshots from X1_trpts with a color gradient
+    for i, X1_trpt in enumerate(X1_trpts):
+        if np.isnan(X1_trpt).any():
+            continue
+        X1_hat_vis = X1_trpt
+        ax1.scatter(X1_hat_vis[:, 0], X1_hat_vis[:, 1], color=snapshot_colors[i], alpha=0.75, s=5, zorder = 1)
+
+    
+    # Add a small color bar inside the plot
+    cax = ax1.inset_axes([1.02, 0.2, 0.03, 0.6])  # [x, y, width, height] (relative position)
+    
+    # Create the colorbar with increased size
+    cbar = plt.colorbar(sm, cax=cax)
+    
+    # Set manual tick positions
+    cbar.set_ticks(np.linspace(0, 4, 5))  # Ensures ticks at 0, 1, 2, 3, 4
+    
+    # Optional: Explicitly set tick labels if needed
+    cbar.set_ticklabels([0, 1, 2, 3, 4])  
+    
+    # Increase colorbar label font size
+    cbar.set_label("Time", fontsize=20)  
+    
+    # Increase colorbar tick font size
+    cbar.ax.tick_params(labelsize=20)
+
+    # Adjust colorbar thickness
+    #cbar.ax.set_aspect(20)  # Increase aspect ratio to make it thicker
+   
+    # Set labels and title
+    ax1.set_xlabel("PC 1", fontsize = 20)
+    ax1.set_ylabel("PC 2", fontsize = 20)
+    ax1.tick_params(axis='both', which='major', labelsize=20)  # Increase tick sizes
+    #ax1.legend(loc='upper right', fontsize= 24)
+    ax1.set_title("")
+
+    # Save or show the plot
+    if output_file_with_snapshots:
+        plt.savefig(output_file_with_snapshots, dpi=300, bbox_inches='tight')
+        print(f"Static trajectory plot WITH snapshots saved to {output_file_with_snapshots}")
+        plt.close(fig1)
+    else:
+        plt.show()
+
+    # **Plot 2: Without Snapshots**
+    fig2, ax2 = plt.subplots(figsize=(8, 6))
+
+    ax2.scatter(X1_vis[:, 0], X1_vis[:, 1], color=color_map[source_t], alpha=1.0, s=12, zorder = 10, label=f'Time {source_t} (Training Data)')
+    ax2.scatter(Xm_vis[:, 0], Xm_vis[:, 1], color=color_map[middle_t], alpha=1.0, s=12, zorder = 10, label=f'Time {middle_t} (Training Data)')
+    ax2.scatter(X2_vis[:, 0], X2_vis[:, 1], color=color_map[target_t], alpha=1.0, s=12, zorder = 10, label=f'Time {target_t} (Training Data)')
+
+    # Plot intermediate time points
+    for t in intermediate_days:
+        X_intermediate_vis = pca.transform(mats[t])
+        ax2.scatter(X_intermediate_vis[:, 0], X_intermediate_vis[:, 1], color=color_map[t], facecolors='none', edgecolors=color_map[t], linewidths=1.2, alpha=1.0, s=15, zorder = 20,  label=f'Time {t} (Test Data)')
+
+    # Set labels and title
+    ax2.set_xlabel("PC 1", fontsize = 20)
+    ax2.set_ylabel("PC 2", fontsize = 20)
+    ax2.tick_params(axis='both', which='major', labelsize=20)  # Increase tick sizes
+    #ax2.legend(loc='upper right', fontsize='small')
+    ax2.set_title("")
+
+    # Save or show the plot
+    if output_file_without_snapshots:
+        plt.savefig(output_file_without_snapshots, dpi=300, bbox_inches='tight')
+        print(f"Static trajectory plot WITHOUT snapshots saved to {output_file_without_snapshots}")
+        plt.close(fig2)
+    else:
+        plt.show()
+
+
+    
+    # Extract legend elements
+    handles, labels = ax1.get_legend_handles_labels()
+    
+    # Extract numeric values from "Time X (Input Data)" and "Time X (Test Data)"
+    time_labels = []
+    for label in labels:
+        try:
+            time_value = int(label.split(" ")[1])  # Extract the numerical value after "Time"
+            time_labels.append((time_value, label))  # Store (time, label) pairs
+        except ValueError:
+            time_labels.append((float('inf'), label))  # Place non-time labels at the end
+    
+    # Sort legend by time values
+    time_labels.sort(key=lambda x: x[0])  # Sort by the extracted numeric value
+    sorted_labels = [item[1] for item in time_labels]
+    sorted_handles = [handles[labels.index(label)] for label in sorted_labels]
+    
+    # **Increase marker size in legend**
+    for handle in sorted_handles:
+        if isinstance(handle, plt.Line2D):  # Ensure we're modifying scatter markers
+            handle.set_markersize(30)  # Adjust marker size
+    
+    # Create a separate figure for the legend
+    fig_legend, ax_legend = plt.subplots(figsize=(10, 2))  # Adjust size as needed
+    ax_legend.axis("off")  # Remove axes
+        
+    # Create legend with larger markers for scatter plots
+    legend = ax_legend.legend(
+        sorted_handles, sorted_labels, fontsize=24, loc='center',
+        ncol=len(sorted_labels), markerscale=4  # Increase scatter marker size
+    )
+    
+    # Save the legend separately
+    # legend_path = os.path.join(result_dir, "legend_only.png")
+    # fig_legend.savefig(legend_path, bbox_inches="tight")
+    plt.close(fig_legend)  # Close the legend figure
+    
 
 def gene_dynamics_whole_saveonly(full_matrix, pca,gene_names, source_t, target_t,X1_trpts,mats, optimal_k, gene_of_interest, index,p, max_i,
                               intermediate_t = [1], img_src = None, img_src_2 = None, img_src_3 = None):
@@ -2038,6 +3373,159 @@ def plot_X1_hat_displacement_distribution(X1_trpts, csv_output,plot_output, hist
     #hist_output_path = f"{output_dir}{exp_memo}_X1_hat_displacement_histogram.csv"
     hist_df.to_csv(hist_output_path, index=False)
 
+def generate_static_cluster_plot_deviation_colormap_Robin_PT2(pca,
+    source_t, target_t, start_i,X1_trpts,mats, index,intermediate_t=[1, 2, 3],output_file = None
+):
+    """
+    Generate a static plot of all snapshots from X1_trpts, colored by sub-trajectories with gradient coloring.
+    Also generates a separate legend figure and individual plots per subgroup.
+    """
+
+
+    # Step 1: Reduce real data and predictions to PCA space
+    last_day = mats[target_t]
+    last_day_reduced = pca.transform(last_day).astype(np.float32)
+    X1_hat_last = X1_trpts[-1].astype(np.float32)
+    X1_hat_first = X1_trpts[0].astype(np.float32)
+    displacements = np.linalg.norm(X1_hat_last - X1_hat_first, axis=1)
+
+    # 862, 3 and 5 (ER)
+    # 887 0.8 and 1.3 (ER)
+    # BMC 1.0 and 3.0 (ER)
+    # Rinath 2.89 and 2.90 (ER)
+
+    # 862, 1.3 and 2 (R)
+    # 887 0.8 and 1.2 (R)
+    # BMC 1.2 and 2.4 (R)
+    # Rinath 3.2 and 3.8 (R)
+
+    ## R genes
+    #862 local minima x-values: [1.288 2.365]
+    #887 local minima x-values: [0.699 1.149]
+    #BMC local minima x-values: [1.145 1.937]
+    #In vitro local minima x-values: [3.017 3.853]
+
+
+    # Assign labels based on displacement
+    X1_hat_labels = np.full(displacements.shape, 'low', dtype=object)
+    X1_hat_labels[(displacements > 6) & (displacements <= 8)] = 'medium'
+    X1_hat_labels[displacements > 8] = 'high'
+
+    # Define colormaps per subgroup (avoid lightest tones by clipping range)
+    label_to_cmap = {
+        'low': colormaps['Oranges'],
+        'medium': colormaps['Purples'],
+        'high': colormaps['Greens']
+    }
+    cmap_clip = slice(75, 256)
+    color_range = np.linspace(0, 1, 256)[cmap_clip]  # consistent use
+
+    # Set file path for main plot
+    #output_file = f"{result_dir}{exp_memo}_static_celltypes_plot_deviation_colormap.png"
+    fig, ax = plt.subplots(figsize=(8, 6))
+    X2_vis = pca.transform(mats[target_t])
+    X1_vis = pca.transform(mats[source_t])
+
+    total_steps = len([i for i in range(len(X1_trpts)) if i % index == 0 and i >= start_i])
+
+    for label in np.unique(X1_hat_labels):
+        cmap = label_to_cmap[label]
+        idx = (X1_hat_labels == label)
+
+        for step_idx, i in enumerate(range(start_i, len(X1_trpts), index)):
+            if np.isnan(X1_trpts[i]).any():
+                continue
+            X1_hat_vis = X1_trpts[i]
+            norm_val = step_idx / max(total_steps - 1, 1)
+            color_idx = int(norm_val * (len(color_range) - 1))
+            color = cmap(color_range[color_idx])
+            ax.scatter(X1_hat_vis[idx, 0], X1_hat_vis[idx, 1], color=color, alpha=0.9, s=3, zorder=1)
+
+            if i > start_i:
+                prev_X1_hat_vis = X1_trpts[i - index]
+                prev_idx = idx
+                ax.plot([
+                    prev_X1_hat_vis[prev_idx, 0], X1_hat_vis[idx, 0]
+                ], [
+                    prev_X1_hat_vis[prev_idx, 1], X1_hat_vis[idx, 1]
+                ], color=color, alpha=0.6, linewidth=1.2, zorder=0)
+
+    for t in intermediate_t:
+        X_intermediate_vis = pca.transform(mats[t])
+        ax.scatter(X_intermediate_vis[:, 0], X_intermediate_vis[:, 1],
+                   color='lightgray', alpha=0.7, s=10, zorder=10)
+
+    ax.set_xlabel("PC 1", fontsize=20)
+    ax.set_ylabel("PC 2", fontsize=20)
+    ax.tick_params(axis='both', which='major', labelsize=20)
+    ax.set_title("")
+
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Static cluster plot saved to {output_file}")
+
+    # --- Save colormap legend with thinner bars side by side ---
+    fig_legend, axs = plt.subplots(1, len(label_to_cmap), figsize=(20, 1.5))
+    if len(label_to_cmap) == 1:
+        axs = [axs]
+
+    for ax, (label, base_cmap) in zip(axs, label_to_cmap.items()):
+        # Create a new clipped colormap
+        clipped_cmap = base_cmap(np.linspace(0, 1, 256)[cmap_clip])
+        custom_cmap = plt.matplotlib.colors.ListedColormap(clipped_cmap)
+    
+        # Use that in the legend
+        gradient = np.linspace(0, 1, cmap_clip.stop - cmap_clip.start).reshape(1, -1)
+        ax.imshow(gradient, aspect='auto', cmap=custom_cmap, extent=[0, 1, 0, 0.03])
+        ax.set_title(f"{label.capitalize()} phenotypic shift \nPre-treatment → Post-treatment", fontsize=20)
+        ax.axis('off')
+
+
+    legend_path = output_file.replace('.png', '_legend.png')
+    plt.tight_layout()
+    plt.savefig(legend_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Legend saved to {legend_path}")
+
+    # --- Additional per-label plots ---
+    for current_label in np.unique(X1_hat_labels):
+        fig_lbl, ax_lbl = plt.subplots(figsize=(8, 6))
+        cmap = label_to_cmap[current_label]
+        idx = (X1_hat_labels == current_label)
+
+        for step_idx, i in enumerate(range(start_i, len(X1_trpts), index)):
+            if np.isnan(X1_trpts[i]).any():
+                continue
+            X1_hat_vis = X1_trpts[i]
+            norm_val = step_idx / max(total_steps - 1, 1)
+            color_idx = int(norm_val * (len(color_range) - 1))
+            color = cmap(color_range[color_idx])
+            ax_lbl.scatter(X1_hat_vis[idx, 0], X1_hat_vis[idx, 1],
+                           color=color, alpha=0.8, s=3, zorder=2)
+
+            if i > start_i:
+                prev_X1_hat_vis = X1_trpts[i - index]
+                prev_idx = idx
+                ax_lbl.plot([
+                    prev_X1_hat_vis[prev_idx, 0], X1_hat_vis[idx, 0]
+                ], [
+                    prev_X1_hat_vis[prev_idx, 1], X1_hat_vis[idx, 1]
+                ], color=color, alpha=0.6, linewidth=1.2)
+
+        ax_lbl.scatter(X1_vis[:, 0], X1_vis[:, 1], color='lightgray', alpha=0.7, s=10, zorder=1)
+        ax_lbl.scatter(X2_vis[:, 0], X2_vis[:, 1], color='lightgray', alpha=0.7, s=10, zorder=1)
+
+        ax_lbl.set_xlabel("PC 1", fontsize=20)
+        ax_lbl.set_ylabel("PC 2", fontsize=20)
+        ax_lbl.tick_params(axis='both', labelsize=20)
+        ax_lbl.set_title("", fontsize=20)
+        plt.tight_layout()
+        plt.savefig(f"{output_file.replace('.png', f'_label_{current_label}.png')}", dpi=300, bbox_inches='tight')
+        plt.close(fig_lbl)
+
+    return X1_hat_labels
+
+
 
 def generate_static_cluster_plot_deviation_colormap_MCF7(pca,
     source_t, target_t, start_i,X1_trpts,mats, index,intermediate_t=[1, 2, 3],output_file = None
@@ -2654,6 +4142,232 @@ def generate_static_cluster_plot_deviation_colormap_887(pca,
 ## ## This is for breast cancer cell line's data, Time [0 , 4]
 # Plot gene dynamis for each trajectory
 ## Subtrajectories defined by source
+
+def Average_gene_dynamics_whole_saveonly_single_trajectory_Robin(
+    pca, gene_names, source_t, target_t, X1_trpts, mats,
+    gene_of_interest, index, p, max_i,
+    intermediate_t=[1],
+    subgroup_output_file=None,
+    cluster_save_path=None
+):
+
+    dt = p['numerical_ts'][-1] / 200
+    physical_dt = dt * p['ts'][-1] / p['numerical_ts'][-1]
+
+    intermediate_t = np.array(intermediate_t)
+
+    if len(intermediate_t) == 0:
+        intermediate_t = range(source_t + 1, target_t)
+
+    day1, day2 = source_t, target_t
+    X1_trpt = X1_trpts[-1]
+
+    if not os.path.exists(cluster_save_path):
+        raise FileNotFoundError(f"Cluster labels file not found: {cluster_save_path}")
+
+    df_clusters = pd.read_csv(cluster_save_path)
+    X1_hat_labels = df_clusters["Cluster_Label"].values
+
+    unique_labels = np.unique(X1_hat_labels)
+    print(f"Number of unique labels in X1_hat_labels: {len(unique_labels)}")
+    print(f"Unique labels: {unique_labels}")
+
+    gene_index = list(gene_names).index(gene_of_interest)
+
+    X1_vis_pca = pca.transform(mats[source_t])
+    X1_vis_i_pca = pca.inverse_transform(X1_vis_pca)
+
+    X2_vis_pca = pca.transform(mats[target_t])
+    X2_vis_i_pca = pca.inverse_transform(X2_vis_pca)
+
+    gene_expression_X1 = X1_vis_i_pca[:, gene_index]
+    gene_expression_X2 = X2_vis_i_pca[:, gene_index]
+
+    gene_expression_intermediates = []
+    for t in intermediate_t:
+        X1_intermediate_vis_pca = pca.transform(mats[t])
+        X1_intermediate_vis_i_pca = pca.inverse_transform(X1_intermediate_vis_pca)
+        gene_expression_intermediates.append(
+            X1_intermediate_vis_i_pca[:, gene_index]
+        )
+
+    gene_expression_X1_trpts = np.concatenate([
+        pca.inverse_transform(X1_trpt)[:, gene_index]
+        for i, X1_trpt in enumerate(X1_trpts)
+        if i % index == 0 and i <= max_i
+    ])
+
+    gene_expression_X1_normalized = gene_expression_X1
+    gene_expression_intermediates_normalized = gene_expression_intermediates
+    gene_expression_X2_normalized = gene_expression_X2
+    gene_expression_X1_trpts_normalized = gene_expression_X1_trpts
+
+    indices = range(0, len(X1_trpts), index)
+
+    subtrajectory_colors = ['green', 'orange', 'purple', 'blue', 'red', 'brown']
+    violin_colors = ["black", "black"]
+
+    subgroup_color_map = {
+        label: subtrajectory_colors[i % len(subtrajectory_colors)]
+        for i, label in enumerate(unique_labels)
+    }
+
+    label_mapping = {
+        old_label: new_label + 1
+        for new_label, old_label in enumerate(unique_labels)
+    }
+
+    fig, ax1 = plt.subplots(figsize=(12, 7))
+
+    # ============================================
+    # CHANGED: rescale trajectory from 0 → 1
+    # ============================================
+    num_points = len(indices)
+    x_positions = np.linspace(0, 1, num_points)
+
+    cell_trajectories = {
+        cell_idx: []
+        for cell_idx in range(X1_trpts[0].shape[0])
+    }
+
+    for i, time_idx in enumerate(indices):
+        if time_idx > max_i:
+            break
+
+        X1_trpt = X1_trpts[time_idx]
+
+        if np.isnan(X1_trpt).any():
+            break
+
+        gene_expression_values = pca.inverse_transform(
+            X1_trpt
+        )[:, gene_index]
+
+        for cell_idx, expr_value in enumerate(gene_expression_values):
+            cell_trajectories[cell_idx].append(expr_value)
+
+    legend_patches = []
+
+    for label in unique_labels:
+        first_plotted = False
+
+        for cell_idx, traj in cell_trajectories.items():
+            if len(traj) != len(x_positions):
+                continue
+
+            if X1_hat_labels[cell_idx] == label:
+                ax1.plot(
+                    x_positions,
+                    traj,
+                    color=subgroup_color_map[label],
+                    alpha=0.3,
+                    linewidth=1.5
+                )
+
+                if not first_plotted:
+                    legend_patches.append(
+                        mpatches.Patch(
+                            color=subgroup_color_map[label],
+                            label=f'Trajectory of {label_mapping[label]} phenotypic shift'
+                        )
+                    )
+                    first_plotted = True
+
+    # Only plot the two real input time points:
+    # source_t = 0, target_t = 1
+    violin_data = [
+        gene_expression_X1_normalized,  # mats[source_t]
+        gene_expression_X2_normalized   # mats[target_t]
+    ]
+    
+    violin_x_positions = np.array([0, 1])
+
+    for i, (x_pos, data) in enumerate(zip(violin_x_positions, violin_data)):
+        sns.violinplot(
+            data=[data],
+            ax=ax1,
+            inner=None,
+            linewidth=1.2,
+            width=0.15,
+            cut=0,
+            scale="width",
+            color=violin_colors[i],
+            alpha=0.8,
+            zorder=3
+        )
+
+        for violin in ax1.collections[-1:]:
+            for path in violin.get_paths():
+                path.vertices[:, 0] += x_pos - path.vertices[:, 0].mean()
+
+    # ============================================
+    # CHANGED: x-axis limits
+    # ============================================
+    ax1.set_xlim(-0.15, 1.15)
+
+    # ============================================
+    # CHANGED: ticks now 0 and 1
+    # ============================================
+    ax1.set_xticks([0, 1])
+    ax1.set_xticklabels(
+        ["Primary", "Recurrence"],
+        fontsize=24
+    )
+
+    ax1.tick_params(axis='y', labelsize=24)
+
+    ax1.set_xlabel('Time', fontsize=24)
+    ax1.set_ylabel('Gene Expression', fontsize=24)
+    ax1.set_title(f'{gene_of_interest}', fontsize=24)
+
+    plt.savefig(
+        subgroup_output_file,
+        dpi=300,
+        bbox_inches='tight'
+    )
+    plt.close()
+
+    label_descriptions = {
+    "low": "Trajectory of low phenotypic shift",
+    "medium": "Trajectory of medium phenotypic shift",
+    "high": "Trajectory of high phenotypic shift"}
+
+
+    # Thicker lines using `linewidth`
+    legend_patches = [
+        mlines.Line2D(
+            [], [], color=color, linestyle='-', linewidth=3,  # ← thicker line here
+            markersize=10,
+            label=f"{label_descriptions.get(ctype, '')}"
+        )
+        for ctype, color in zip(unique_labels, subtrajectory_colors)
+    ]
+
+
+    # 🎨 **Violin Plot Legend**
+    violin_legend_patches = [
+        mpatches.Patch(color="black", label="Input Data")
+    ]
+    
+    # 🎨 **Create Separate Legend Figure (HORIZONTAL LAYOUT)**
+    fig_legend, ax_legend = plt.subplots(figsize=(10, 2))  # Wider aspect ratio for horizontal layout
+    ax_legend.axis("off")  # Hide axes
+    
+    # **Combine both legends**
+    combined_legend = legend_patches + violin_legend_patches
+    
+    ax_legend.legend(
+        handles=combined_legend,
+        loc="center", fontsize=24, title="",
+        title_fontsize=24, ncol=len(combined_legend),  # Horizontal layout
+        frameon=True, handletextpad=2, columnspacing=2
+    )
+    
+    # Save the separate legend
+    legend_output_file = subgroup_output_file.replace(".png", "_legend.png")
+    plt.savefig(legend_output_file, dpi=300, bbox_inches='tight')
+    plt.close()
+
 
 def Average_gene_dynamics_whole_saveonly_single_trajectory_NDPR_breast_cancer(pca, gene_names, source_t, target_t, X1_trpts,mats, gene_of_interest, index,p, max_i, intermediate_t = [1], subgroup_output_file = None, cluster_save_path = None):
 
@@ -4338,6 +6052,346 @@ def difference_of_means_stem(gene_names, subtraj_dir):
 ## ## This is for Stem Cell data, Time [0 , 1,  2, 3,  4]
 ## Plot gene dynamis for each trajectory
 
+
+
+
+def Average_gene_dynamics_whole_saveonly_single_trajectory_Axolotl(pca, gene_names, source_t, target_t,X1_trpts,mats,optimal_k, gene_of_interest, index, p, max_i,
+                              intermediate_t = [1], img_src = None, cluster_save_path = "X1_hat_clusters.csv",subgroup_output_file = None):
+
+
+    
+    dt = p['numerical_ts'][-1]/200
+    
+    physical_dt = dt * p['ts'][-1] / p['numerical_ts'][-1]
+    
+    intermediate_t = np.array(intermediate_t)
+    
+    if len(intermediate_t) == 0:
+        intermediate_t = range(source_t+1, target_t)
+        
+    # data parameters
+    day1, day2 = source_t, target_t
+    X1_trpt = X1_trpts[-1]
+    
+    
+    contrast_colors = [
+    '#1f77b4',  # blue
+    '#2ca02c',  # green
+    '#ff7f0e',  # orange
+    '#8c564b',  # brown
+    '#d62728',  # red 
+    '#9467bd'  # purple (to be used for index 8)
+    ]
+
+
+    # Step 1: Perform clustering analysis on the last day's cell states from mats
+    last_day = mats[day2]
+
+    last_day_reduced = pca.transform(last_day).astype(np.float32)
+    
+    # Perform KMeans clustering with the optimal number of clusters
+    kmeans = KMeans(n_clusters=optimal_k, random_state=40)
+    kmeans.fit(last_day_reduced)
+    last_day_labels = kmeans.labels_
+    
+    # Load previously saved cluster labels
+    #cluster_save_path = f"{result_dir}{exp_memo}_X1_hat_clusters.csv"
+    if not os.path.exists(cluster_save_path):
+        raise FileNotFoundError(f"Cluster labels file not found: {cluster_save_path}")
+    
+    df_clusters = pd.read_csv(cluster_save_path)
+    X1_hat_labels = df_clusters["Cluster_Label"].values  # Load saved labels
+
+    # Print the number of unique labels in last_day_labels
+    unique_labels = np.unique(X1_hat_labels)
+    print(f"Number of unique labels in X1_hat_labels: {len(unique_labels)}")
+    print(f"Unique labels: {unique_labels}")
+
+    
+    # Define a function to create colors for the subgroups using a predefined set of colors
+    def get_subgroup_colors(labels, colors):
+        unique_labels = np.unique(labels)
+        if len(colors) < len(unique_labels):
+            raise ValueError("Not enough colors for the number of unique labels.")
+        subgroup_colors = {label: colors[i] for i, label in enumerate(unique_labels)}
+        return subgroup_colors
+
+    # Define specific sets of colors for the blue and red subgroups
+    blue_colors = ['#1f77b4', '#878ceb', '#104E8B', '#87CEEB', '#4682B4', '#6495ED', '#5F9EA0']  # Add more shades of blue as needed
+    red_colors = ['#d62728',  '#eb8787', '#FF4500', '#DC143C', '#FF6347', '#B22222', '#8B0000']  # Add more shades of red as needed
+    light_red_colors = ['#f99fa1', '#ffb1b1', '#ffaf86', '#f48585', '#ffb5a5', '#ff9c9c', '#ff5f5f']
+    
+    # Get the subgroup colors based on the labels
+    subgroup_colors_blue = get_subgroup_colors(X1_hat_labels, blue_colors)
+    subgroup_colors_red = get_subgroup_colors(X1_hat_labels, red_colors)
+
+    #mask = last_day_labels == 0
+    
+    
+    # Extract the gene index for the gene of interest
+    gene_index = list(gene_names).index(gene_of_interest)
+    
+    # Extract gene expression values from mats[day1], intermediate time points, and mats[day2]
+    X1_vis_pca = pca.transform(mats[source_t])
+    X1_vis_i_pca = pca.inverse_transform(X1_vis_pca)
+    X2_vis_pca = pca.transform(mats[target_t])
+    X2_vis_i_pca = pca.inverse_transform(X2_vis_pca)
+
+    gene_expression_X1 = X1_vis_i_pca[:, gene_index]
+    gene_expression_X2 = X2_vis_i_pca[:, gene_index]
+
+    gene_expression_intermediates = []
+    for t in intermediate_t:
+        X1_intermediate_vis_pca = pca.transform(mats[t])
+        X1_intermediate_vis_i_pca = pca.inverse_transform(X1_intermediate_vis_pca)
+        gene_expression_intermediates.append(X1_intermediate_vis_i_pca[:, gene_index])
+
+    # Extract gene expression values from X1_trpts based on the given condition
+    
+    gene_expression_X1_trpts = np.concatenate([pca.inverse_transform(X1_trpt)[:, gene_index] for i, X1_trpt in enumerate(X1_trpts) if i % index == 0 and i <= max_i])
+    
+    # Combine all gene expression values
+    all_gene_expression_values = np.concatenate([gene_expression_X1, *gene_expression_intermediates, gene_expression_X2, gene_expression_X1_trpts])
+
+    gene_expression_X1_normalized = gene_expression_X1
+    gene_expression_intermediates_normalized = gene_expression_intermediates
+    gene_expression_X2_normalized = gene_expression_X2
+    gene_expression_X1_trpts_normalized = gene_expression_X1_trpts
+    
+    vmin = all_gene_expression_values.min()
+    vmax = all_gene_expression_values.max()
+    
+    # Plot dynamics for X1_trpts with subgroup colors
+    indices = range(len(X1_trpts))
+
+    all_gene_expression_values_normalized_X1 = gene_expression_X1_trpts_normalized
+    
+
+    
+    # (1) Plot the averaged gene expressions across X1_trpt at each time point with confidence intervals
+    
+    # Compute the average gene expression and confidence intervals
+    avg_gene_expressions = []
+    ci_gene_expressions = []
+    
+    # Reset normalized gene expression values for X1_trpts
+    all_gene_expression_values_normalized_X1 = gene_expression_X1_trpts_normalized
+    
+    # Use indices with the specified step size defined by `index`
+    indices = range(0, len(X1_trpts), index)
+
+    
+    # Iterate through indices to compute averages and confidence intervals
+    for i in indices:
+        if i > max_i:  # Apply truncation based on max_i
+            break
+        X1_trpt = X1_trpts[i]
+        if np.isnan(X1_trpt).any():
+            break
+    
+        # Inverse transform the current trajectory
+        X1_hat = pca.inverse_transform(X1_trpt)
+    
+        # Extract gene expression values for the current step
+        gene_expression_values = all_gene_expression_values_normalized_X1[:len(X1_hat)]
+        all_gene_expression_values_normalized_X1 = all_gene_expression_values_normalized_X1[len(X1_hat):]  # Update to exclude used values
+    
+        # Compute average and confidence interval
+        avg_gene_expressions.append(np.mean(gene_expression_values))
+        ci = stats.sem(gene_expression_values) * stats.t.ppf((1 + 0.95) / 2., len(gene_expression_values) - 1)
+        ci_gene_expressions.append(ci)
+    
+    # Process intermediate time points
+    intermediate_avg_expressions = []
+    intermediate_ci_expressions = []
+    intermediate_indices = []
+
+
+    for idx, t in enumerate(intermediate_t):
+        gene_expression_intermediate = gene_expression_intermediates_normalized[idx]
+        intermediate_avg_expressions.append(np.mean(gene_expression_intermediate))
+        ci = stats.sem(gene_expression_intermediate) * stats.t.ppf((1 + 0.95) / 2., len(gene_expression_intermediate) - 1)
+        intermediate_ci_expressions.append(ci)
+    
+        # Rescale the intermediate time points to align with `index`
+        shifted_value_1 = intermediate_t - 1
+        shifted_value_2 = intermediate_t[0] - 1
+        shifted_t_1 = t - shifted_value_1
+        shifted_t_2 = t - shifted_value_2
+        time_index = int((float(shifted_t_2) / (float(max(shifted_t_1)) + 1)) * len(indices))
+        intermediate_indices.append(time_index)
+
+    
+    # Include first and last time points
+    all_avg_expressions = [np.mean(gene_expression_X1_normalized)] + intermediate_avg_expressions + [np.mean(gene_expression_X2_normalized)]
+    all_ci_expressions = [
+        stats.sem(gene_expression_X1_normalized) * stats.t.ppf((1 + 0.95) / 2., len(gene_expression_X1_normalized) - 1)
+    ] + intermediate_ci_expressions + [
+        stats.sem(gene_expression_X2_normalized) * stats.t.ppf((1 + 0.95) / 2., len(gene_expression_X2_normalized) - 1)
+    ]
+
+        
+    all_indices = [0] + intermediate_indices + [len(indices)]
+    combined_indices = sorted([day1] + intermediate_t.tolist() + [day2])
+
+    print(combined_indices)
+
+    
+    # Ensure extended_indices align with avg_gene_expressions
+    extended_indices = np.array([x * index for x in range(len(avg_gene_expressions))])
+    
+    # Ensure all_indices and extended_indices are NumPy arrays
+    combined_indices = np.array(combined_indices)
+    extended_indices = np.array(extended_indices)
+    
+    # Linearly rescale all_indices to be equally distributed in extended_indices
+    rescaled_indices = np.interp(
+        combined_indices,  # Original indices
+        [combined_indices[0], combined_indices[-1]],  # Range of all_indices
+        [extended_indices[0], extended_indices[-1]]  # Range of extended_indices
+    )
+
+    
+    
+    # Define **subtrajectory colors** (for cell trajectories)
+    subtrajectory_colors = ["teal","magenta","orange","navy","gold"]
+    #subtrajectory_colors = ['violet']
+    
+    # Define **violin plot colors** for the three time points
+    #violin_colors = ["#3cb44b", "#f58231", "#3cb44b", "#f58231", "#3cb44b"]  # Green, Orange, Purple
+    violin_colors = ["black", "gray", "black", "gray", "black"] 
+    
+    # Map each subgroup label to a **trajectory color** and shift labels from 0,1 → 1,2
+    unique_labels = np.unique(X1_hat_labels)
+    subgroup_color_map = {label: subtrajectory_colors[i % len(subtrajectory_colors)] for i, label in enumerate(unique_labels)}
+    label_mapping = {old_label: new_label + 1 for new_label, old_label in enumerate(unique_labels)}
+    
+    # Define filename for saving
+    #subgroup_output_file = f"{output_dir}/Individual_trajectories_violin_plot_{gene_of_interest}.png"
+    
+    # (2) **Create Figure**
+    fig, ax1 = plt.subplots(figsize=(12, 7))
+    
+    # (3) **Ensure Proper x-axis Scaling**
+    num_points = len(indices)
+    x_positions = np.linspace(0, 4, num_points)  # Scale to match `[0, 2, 4]`
+    
+    # (4) **Extract Cell Trajectories for Each Gene**
+    cell_trajectories = {cell_idx: [] for cell_idx in range(X1_trpts[0].shape[0])}
+    
+    for i, time_idx in enumerate(indices):
+        if time_idx > max_i:
+            break
+        X1_trpt = X1_trpts[time_idx]
+        if np.isnan(X1_trpt).any():
+            break
+    
+        # Extract **expression values of the gene of interest** from each cell at this time point
+        gene_expression_values = pca.inverse_transform(X1_trpt)[:, gene_index]
+    
+        # Append the expression value at this time to each cell’s trajectory
+        for cell_idx, expr_value in enumerate(gene_expression_values):
+            cell_trajectories[cell_idx].append(expr_value)
+    
+    # (5) **Plot Individual Trajectories per Subgroup**
+    legend_patches = []  # Store legend handles
+    for label in unique_labels:
+        first_plotted = False  # Track if we added a legend entry for this subgroup
+        
+        for cell_idx, traj in cell_trajectories.items():
+            if len(traj) != len(x_positions):
+                continue  # Ensure trajectories align with time points
+    
+            if X1_hat_labels[cell_idx] == label:  # Match subgroup label from step 1
+                ax1.plot(
+                    x_positions, traj,  
+                    color=subgroup_color_map[label],  # ✅ Use the **subtrajectory colors**
+                    alpha=0.7, linewidth=1.0 
+                )
+                
+                # Add a single legend entry for each subgroup (renaming from 0,1 → 1,2)
+                if not first_plotted:
+                    legend_patches.append(mpatches.Patch(color=subgroup_color_map[label], label=f'Trajectory {label_mapping[label]}'))
+                    first_plotted = True
+    
+    # (6) **Ensure Violin Plots are at `[0, 2, 4]` & Appear in Front**
+    violin_data = [
+        gene_expression_X1_normalized,
+        *gene_expression_intermediates_normalized,
+        gene_expression_X2_normalized
+    ]
+    
+    violin_x_positions = np.array([0, 1, 2, 3, 4])  # Ensure correct positions
+    
+    # 🎻 **Plot Violin Plots with Correct Colors and Transparency**
+    for i, (x_pos, data) in enumerate(zip(violin_x_positions, violin_data)):
+        violin_parts = sns.violinplot(
+            data=[data],  
+            ax=ax1,
+            inner=None,  # ✅ REMOVE QUARTILE LINES
+            linewidth=1.2,
+            width=0.7,
+            cut=0,
+            scale="width",
+            color=violin_colors[i],  # ✅ Assign correct color
+            alpha=0.8,  # ✅ MAKE TRANSPARENT
+            zorder=3  # ✅ BRINGS VIOLINS TO THE FRONT
+        )
+        
+        # **Manually Adjust X-Position of Each Violin**
+        for violin in ax1.collections[-1:]:  # Only adjust the last added violin
+            for path in violin.get_paths():
+                path.vertices[:, 0] += x_pos - path.vertices[:, 0].mean()  
+    
+    # **Expand x-axis limits to prevent cutting off last violin plot**
+    ax1.set_xlim(-0.5, 4.5)  
+    
+    # 🛠 **Fix x-axis labels and ensure proper alignment**
+    ax1.set_xticks([0, 1, 2, 3, 4])  
+    ax1.set_xticklabels([0, 1, 2, 3, 4], fontsize=35)
+    ax1.tick_params(axis='y', labelsize=35)
+    
+    ax1.set_xlabel('Time', fontsize=35)
+    ax1.set_ylabel('Gene Expression', fontsize=35)
+    ax1.set_title(f'Single Cell {gene_of_interest} Expression Dynamics', fontsize=35)
+
+
+    # 🎨 **Save the main figure without a legend**
+    plt.savefig(subgroup_output_file, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+
+    # 🎨 **Redefine `legend_patches` to Include a Green Bar**
+    legend_patches = [
+        mlines.Line2D([], [], color="violet", linestyle="-", linewidth=3, 
+                      label="Gene dynamics of each single cell")
+    ]
+
+    # 🎨 **Violin Plot Legend**
+    violin_legend_patches = [
+        mpatches.Patch(color="black", label="Input Data"),
+        mpatches.Patch(color="gray", label="Test Data")
+    ]
+    
+    # 🎨 **Create Separate Legend Figure (HORIZONTAL LAYOUT)**
+    fig_legend, ax_legend = plt.subplots(figsize=(10, 2))  # Wider aspect ratio for horizontal layout
+    ax_legend.axis("off")  # Hide axes
+    
+    # **Combine both legends**
+    combined_legend = legend_patches + violin_legend_patches
+    
+    ax_legend.legend(
+        handles=combined_legend,
+        loc="center", fontsize=24, title="",
+        title_fontsize=24, ncol=len(combined_legend),  # Horizontal layout
+        frameon=True, handletextpad=2, columnspacing=2
+    )
+    
+    # Save the separate legend
+    legend_output_file = subgroup_output_file.replace(".png", "_legend.png")
+    plt.savefig(legend_output_file, dpi=300, bbox_inches='tight')
+    plt.close()
+
 ## Subtrajectroies defined by source
 def Average_gene_dynamics_whole_saveonly_single_trajectory_mESC(pca, gene_names, source_t, target_t,X1_trpts,mats,optimal_k, gene_of_interest, index, p, max_i,
                               intermediate_t = [1], img_src = None, cluster_save_path = "X1_hat_clusters.csv",subgroup_output_file = None):
@@ -4809,1065 +6863,371 @@ def Compare_Distribution_Trajectories_Intermediate_mESC(pca, gene_names, source_
     print(f"Legend plot saved separately at: {legend_output_file}")
 
 
-# ── Trajectory Visualization and Subtrajectory Classification ──────────────────
+def Average_gene_dynamics_whole_saveonly_with_violin_plot_Axolotl(pca, gene_names, source_t, target_t,X1_trpts,mats,optimal_k, gene_of_interest, index, p, max_i, intermediate_t = [1], img_src = None, cluster_save_path = "X1_hat_clusters.csv"):
 
-def generate_static_trajectory_plots_three_timepoints(pca,physical_dt, days, intermediate_days, X1_trpts, mats, d_red=26, output_file_with_snapshots=None, output_file_without_snapshots=None):
-    """
-    Generate two static trajectory plots:
-    1. With snapshots from X1_trpts using a color gradient.
-    2. Without snapshots, showing only main time points.
-    """
-    
-    # Define color gradient for snapshots
-    num_snapshots = len(X1_trpts)
-    colormap = cm.viridis  # Can change to "plasma", "inferno", etc.
-    snapshot_colors = [colormap(i / num_snapshots) for i in range(num_snapshots)]
-
-    # Rescale time values for the color bar
-    time_values = np.linspace(0, physical_dt * num_snapshots, num_snapshots)
-
-    # Create a normalization object for the color mapping
-    norm = mcolors.Normalize(vmin=time_values.min(), vmax=time_values.max())
-    sm = cm.ScalarMappable(cmap=colormap, norm=norm)
-    sm.set_array([])  # Needed for color bar
-
-    source_t, middle_t, target_t = days[0], days[1], days[-1]
-    
-    # Define colors for time points
-    color_map = {
-        source_t: '#1f77b4',  # Blue
-        intermediate_days[0]: '#2ca02c',  # Green
-        middle_t: '#ff7f0e',  # Orange
-        intermediate_days[1]: '#8c564b',  # Brown
-        target_t: '#d62728'  # Red
-    }
-
-    # **Plot 1: With Snapshots**
-    fig1, ax1 = plt.subplots(figsize=(8, 6))
-
-    # Plot source, intermediates, and target
-    X1_vis = pca.transform(mats[source_t])
-    Xm_vis = pca.transform(mats[middle_t])
-    X2_vis = pca.transform(mats[target_t])
-    ax1.scatter(X1_vis[:, 0], X1_vis[:, 1], color=color_map[source_t], alpha=1.0, s=12, zorder = 10, label=f'Time {source_t} (Training Data)')
-    ax1.scatter(Xm_vis[:, 0], Xm_vis[:, 1], color=color_map[middle_t], alpha=1.0, s=12, zorder = 10, label=f'Time {middle_t} (Training Data)')
-    ax1.scatter(X2_vis[:, 0], X2_vis[:, 1], color=color_map[target_t], alpha=1.0, s=12, zorder = 10, label=f'Time {target_t} (Training Data)')
-
-    # Plot intermediate time points
-    for t in intermediate_days:
-        X_intermediate_vis = pca.transform(mats[t])
-        ax1.scatter(X_intermediate_vis[:, 0], X_intermediate_vis[:, 1], color=color_map[t], facecolors='none', edgecolors=color_map[t], linewidths=1.2, alpha=1.0, s=15, zorder = 20,  label=f'Time {t} (Test Data)')
-
-    # Plot snapshots from X1_trpts with a color gradient
-    for i, X1_trpt in enumerate(X1_trpts):
-        if np.isnan(X1_trpt).any():
-            continue
-        X1_hat_vis = X1_trpt
-        ax1.scatter(X1_hat_vis[:, 0], X1_hat_vis[:, 1], color=snapshot_colors[i], alpha=0.75, s=5, zorder = 1)
-
-    
-    # Add a small color bar inside the plot
-    cax = ax1.inset_axes([1.02, 0.2, 0.03, 0.6])  # [x, y, width, height] (relative position)
-    
-    # Create the colorbar with increased size
-    cbar = plt.colorbar(sm, cax=cax)
-    
-    # Set manual tick positions
-    cbar.set_ticks(np.linspace(0, 4, 5))  # Ensures ticks at 0, 1, 2, 3, 4
-    
-    # Optional: Explicitly set tick labels if needed
-    cbar.set_ticklabels([0, 1, 2, 3, 4])  
-    
-    # Increase colorbar label font size
-    cbar.set_label("Time", fontsize=20)  
-    
-    # Increase colorbar tick font size
-    cbar.ax.tick_params(labelsize=20)
-
-    # Adjust colorbar thickness
-    #cbar.ax.set_aspect(20)  # Increase aspect ratio to make it thicker
+    dt = p['numerical_ts'][-1]/200
    
-    # Set labels and title
-    ax1.set_xlabel("PC 1", fontsize = 20)
-    ax1.set_ylabel("PC 2", fontsize = 20)
-    ax1.tick_params(axis='both', which='major', labelsize=20)  # Increase tick sizes
-    #ax1.legend(loc='upper right', fontsize= 24)
-    ax1.set_title("")
-
-    # Save or show the plot
-    if output_file_with_snapshots:
-        plt.savefig(output_file_with_snapshots, dpi=300, bbox_inches='tight')
-        print(f"Static trajectory plot WITH snapshots saved to {output_file_with_snapshots}")
-        plt.close(fig1)
-    else:
-        plt.show()
-
-    # **Plot 2: Without Snapshots**
-    fig2, ax2 = plt.subplots(figsize=(8, 6))
-
-    ax2.scatter(X1_vis[:, 0], X1_vis[:, 1], color=color_map[source_t], alpha=1.0, s=12, zorder = 10, label=f'Time {source_t} (Training Data)')
-    ax2.scatter(Xm_vis[:, 0], Xm_vis[:, 1], color=color_map[middle_t], alpha=1.0, s=12, zorder = 10, label=f'Time {middle_t} (Training Data)')
-    ax2.scatter(X2_vis[:, 0], X2_vis[:, 1], color=color_map[target_t], alpha=1.0, s=12, zorder = 10, label=f'Time {target_t} (Training Data)')
-
-    # Plot intermediate time points
-    for t in intermediate_days:
-        X_intermediate_vis = pca.transform(mats[t])
-        ax2.scatter(X_intermediate_vis[:, 0], X_intermediate_vis[:, 1], color=color_map[t], facecolors='none', edgecolors=color_map[t], linewidths=1.2, alpha=1.0, s=15, zorder = 20,  label=f'Time {t} (Test Data)')
-
-    # Set labels and title
-    ax2.set_xlabel("PC 1", fontsize = 20)
-    ax2.set_ylabel("PC 2", fontsize = 20)
-    ax2.tick_params(axis='both', which='major', labelsize=20)  # Increase tick sizes
-    #ax2.legend(loc='upper right', fontsize='small')
-    ax2.set_title("")
-
-    # Save or show the plot
-    if output_file_without_snapshots:
-        plt.savefig(output_file_without_snapshots, dpi=300, bbox_inches='tight')
-        print(f"Static trajectory plot WITHOUT snapshots saved to {output_file_without_snapshots}")
-        plt.close(fig2)
-    else:
-        plt.show()
-
-
-    
-    # Extract legend elements
-    handles, labels = ax1.get_legend_handles_labels()
-    
-    # Extract numeric values from "Time X (Input Data)" and "Time X (Test Data)"
-    time_labels = []
-    for label in labels:
-        try:
-            time_value = int(label.split(" ")[1])  # Extract the numerical value after "Time"
-            time_labels.append((time_value, label))  # Store (time, label) pairs
-        except ValueError:
-            time_labels.append((float('inf'), label))  # Place non-time labels at the end
-    
-    # Sort legend by time values
-    time_labels.sort(key=lambda x: x[0])  # Sort by the extracted numeric value
-    sorted_labels = [item[1] for item in time_labels]
-    sorted_handles = [handles[labels.index(label)] for label in sorted_labels]
-    
-    # **Increase marker size in legend**
-    for handle in sorted_handles:
-        if isinstance(handle, plt.Line2D):  # Ensure we're modifying scatter markers
-            handle.set_markersize(30)  # Adjust marker size
-    
-    # Create a separate figure for the legend
-    fig_legend, ax_legend = plt.subplots(figsize=(10, 2))  # Adjust size as needed
-    ax_legend.axis("off")  # Remove axes
-        
-    # Create legend with larger markers for scatter plots
-    legend = ax_legend.legend(
-        sorted_handles, sorted_labels, fontsize=24, loc='center',
-        ncol=len(sorted_labels), markerscale=4  # Increase scatter marker size
-    )
-    
-    # Save the legend separately
-    # legend_path = os.path.join(result_dir, "legend_only.png")
-    # fig_legend.savefig(legend_path, bbox_inches="tight")
-    plt.close(fig_legend)  # Close the legend figure
-    
-    #print(f"Legend saved separately at: {legend_path}")
-
-## Static plot function for simple GPA (Sample 1 - EMT data)
-
-                    
-def generate_static_trajectory_plots_two_timepoints(pca,physical_dt,days, intermediate_days, X1_trpts, mats, d_red=26, output_file_with_snapshots=None, output_file_without_snapshots=None, output_file_snapshots_only=None):
-    """
-    Generate two static trajectory plots:
-    1. With snapshots from X1_trpts using a color gradient.
-    2. Without snapshots, showing only main time points.
-    """
-
-    
-    # Define color gradient for snapshots
-    num_snapshots = len(X1_trpts)
-    colormap = cm.viridis  # Can change to "plasma", "inferno", etc.
-    snapshot_colors = [colormap(i / num_snapshots) for i in range(num_snapshots)]
-
-    # Rescale time values for the color bar
-    time_values = np.linspace(0, physical_dt * num_snapshots, num_snapshots)
-
-    # Create a normalization object for the color mapping
-    norm = mcolors.Normalize(vmin=time_values.min(), vmax=time_values.max())
-    sm = cm.ScalarMappable(cmap=colormap, norm=norm)
-    sm.set_array([])  # Needed for color bar
-
-   
-    source_t = days[0]
-  
-    target_t = days[1]
-    # target_t = 4
-    # Define colors for time points
-    color_map = {
-        source_t: '#1f77b4',  # Blue
-        intermediate_days[0]: '#ff7f0e',  # Orange
-        target_t: '#d62728'  # Red
-    }
-
-    # **Plot 1: With Snapshots**
-    fig1, ax1 = plt.subplots(figsize=(8, 6))
-
-    # Plot source, intermediates, and target
-    X1_vis = pca.transform(mats[source_t])
-    #Xm_vis = pca.transform(mats[middle_t])
-    X2_vis = pca.transform(mats[target_t])
-    #ax1.scatter(X1_vis[:, 0], X1_vis[:, 1], facecolors='none', edgecolors=color_map[source_t], linewidths=0.5, alpha=1.0, s=20, zorder=10, label=f'Time {source_t}')
-    #ax1.scatter(X2_vis[:, 0], X2_vis[:, 1], facecolors='none', edgecolors=color_map[target_t], linewidths=0.5, alpha=1.0, s=20, zorder=10, label=f'Time {target_t}')
-
-
-    # Plot intermediate time points
-    for t in intermediate_days:
-        X_intermediate_vis = pca.transform(mats[t])
-        ax1.scatter(X_intermediate_vis[:, 0], X_intermediate_vis[:, 1], color=color_map[t], facecolors='none', edgecolors=color_map[t], linewidths=1.0, alpha=0.75, s=10, zorder = 20,  label=f'Day {t} (Test Data)')
-
-    # Plot snapshots from X1_trpts with a color gradient
-    for i, X1_trpt in enumerate(X1_trpts):
-        if np.isnan(X1_trpt).any():
-            continue
-        X1_hat_vis = X1_trpt
-        ax1.scatter(X1_hat_vis[:, 0], X1_hat_vis[:, 1], color=snapshot_colors[i], alpha=0.75, s=2, zorder = 1)
-
-    # Add a small color bar inside the plot
-    cax = ax1.inset_axes([1.02, 0.2, 0.03, 0.6])  # [x, y, width, height] (relative position)
-    
-    # Create the colorbar with increased size
-    cbar = plt.colorbar(sm, cax=cax)
-    
-    # Set manual tick positions
-    cbar.set_ticks(np.linspace(0, 4, 5))  # Ensures ticks at 0, 1, 2, 3, 4
-    
-    # Optional: Explicitly set tick labels if needed
-    cbar.set_ticklabels([0, 1, 2, 3, 4])  
-    
-    # Increase colorbar label font size
-    cbar.set_label("Time", fontsize=20)  
-    
-    # Increase colorbar tick font size
-    cbar.ax.tick_params(labelsize=20)
-
-    # Adjust colorbar thickness
-    #cbar.ax.set_aspect(20)  # Increase aspect ratio to make it thicker
-   
-    # Set labels and title
-    ax1.set_xlabel("PC 1", fontsize = 20)
-    ax1.set_ylabel("PC 2", fontsize = 20)
-    ax1.tick_params(axis='both', which='major', labelsize=20)  # Increase tick sizes
-    #ax1.legend(loc='upper right', fontsize= 24)
-    ax1.set_title("")
-
-    # Save or show the plot
-    if output_file_with_snapshots:
-        plt.savefig(output_file_with_snapshots, dpi=300, bbox_inches='tight')
-        print(f"Static trajectory plot WITH snapshots saved to {output_file_with_snapshots}")
-        plt.close(fig1)
-    else:
-        plt.show()
-
-    # **Plot 2: Without Snapshots**
-    fig2, ax2 = plt.subplots(figsize=(8, 6))
-
-    # Plot only source, intermediates, and target
-    ax2.scatter(X1_vis[:, 0], X1_vis[:, 1], color=color_map[source_t], alpha=1.0, s=8,  zorder = 15, label=f'Time {source_t} (Training Data)')
-    #ax2.scatter(Xm_vis[:, 0], Xm_vis[:, 1], color=color_map[middle_t], alpha=1.0, s=10,  zorder = 10, label=f'Time {middle_t}')
-    ax2.scatter(X2_vis[:, 0], X2_vis[:, 1], color=color_map[target_t], alpha=1.0, s=8,  zorder = 10, label=f'Time {target_t} (Training Data)')
-
-    # Set labels and title
-    ax2.set_xlabel("PC 1", fontsize = 20)
-    ax2.set_ylabel("PC 2", fontsize = 20)
-    ax2.tick_params(axis='both', which='major', labelsize=20)  # Increase tick sizes
-    #ax2.legend(loc='upper right', fontsize='small')
-    ax2.set_title("")
-
-    # Save or show the plot
-    if output_file_without_snapshots:
-        plt.savefig(output_file_without_snapshots, dpi=300, bbox_inches='tight')
-        print(f"Static trajectory plot WITHOUT snapshots saved to {output_file_without_snapshots}")
-        plt.close(fig2)
-    else:
-        plt.show()
-
-
-## Static plot function for simple GPA (breast cancer cell line data)
-
-def generate_static_trajectory_plots_two_timepoints_no_middle(pca,physical_dt,days, intermediate_days, X1_trpts, mats, d_red=26, output_file_with_snapshots=None, output_file_without_snapshots=None, output_file_snapshots_only=None):
-    """
-    Generate two static trajectory plots:
-    1. With snapshots from X1_trpts using a color gradient.
-    2. Without snapshots, showing only main time points.
-    """
-    
-
-    # Define color gradient for snapshots
-    num_snapshots = len(X1_trpts)
-    colormap = cm.viridis  # Can change to "plasma", "inferno", etc.
-    snapshot_colors = [colormap(i / num_snapshots) for i in range(num_snapshots)]
-
-    # Rescale time values for the color bar
-    time_values = np.linspace(0, physical_dt * num_snapshots, num_snapshots)
-
-    # Create a normalization object for the color mapping
-    norm = mcolors.Normalize(vmin=time_values.min(), vmax=time_values.max())
-    sm = cm.ScalarMappable(cmap=colormap, norm=norm)
-    sm.set_array([])  # Needed for color bar
-
-    source_t, middle_t, target_t = days[0], days[1], days[-1]
-    
-    # Define colors for time points
-    color_map = {
-        source_t: '#1f77b4',  # Blue
-        #intermediate_days[0]: '#ff7f0e',  # Orange
-        target_t: '#d62728'  # Red
-    }
-
-    # **Plot 1: With Snapshots**
-    fig1, ax1 = plt.subplots(figsize=(8, 6))
-
-    # Plot source, intermediates, and target
-    X1_vis = pca.transform(mats[source_t])
-    #Xm_vis = pca.transform(mats[middle_t])
-    X2_vis = pca.transform(mats[target_t])
-    #ax1.scatter(X1_vis[:, 0], X1_vis[:, 1], facecolors='none', edgecolors=color_map[source_t], linewidths=0.5, alpha=1.0, s=20, zorder=10, label=f'Time {source_t}')
-    #ax1.scatter(X2_vis[:, 0], X2_vis[:, 1], facecolors='none', edgecolors=color_map[target_t], linewidths=0.5, alpha=1.0, s=20, zorder=10, label=f'Time {target_t}')
-
-
-
-    # Plot snapshots from X1_trpts with a color gradient
-    for i, X1_trpt in enumerate(X1_trpts):
-        if np.isnan(X1_trpt).any():
-            continue
-        X1_hat_vis = X1_trpt
-        ax1.scatter(X1_hat_vis[:, 0], X1_hat_vis[:, 1], color=snapshot_colors[i], alpha=0.75, s=2, zorder = 1)
-
-    # Add a small color bar inside the plot
-    cax = ax1.inset_axes([1.02, 0.2, 0.03, 0.6])  # [x, y, width, height] (relative position)
-    
-    # Create the colorbar with increased size
-    cbar = plt.colorbar(sm, cax=cax)
-    
-    # Set manual tick positions
-    cbar.set_ticks(np.linspace(0, 4, 5))  # Ensures ticks at 0, 1, 2, 3, 4
-    
-    # Optional: Explicitly set tick labels if needed
-    cbar.set_ticklabels([0, 1, 2, 3, 4])  
-    
-    # Increase colorbar label font size
-    cbar.set_label("Time", fontsize=20)  
-    
-    # Increase colorbar tick font size
-    cbar.ax.tick_params(labelsize=20)
-
-    # Adjust colorbar thickness
-    #cbar.ax.set_aspect(20)  # Increase aspect ratio to make it thicker
-   
-    # Set labels and title
-    ax1.set_xlabel("PC 1", fontsize = 20)
-    ax1.set_ylabel("PC 2", fontsize = 20)
-    ax1.tick_params(axis='both', which='major', labelsize=20)  # Increase tick sizes
-    #ax1.legend(loc='upper right', fontsize= 24)
-    ax1.set_title("")
-
-    # Save or show the plot
-    if output_file_with_snapshots:
-        plt.savefig(output_file_with_snapshots, dpi=300, bbox_inches='tight')
-        print(f"Static trajectory plot WITH snapshots saved to {output_file_with_snapshots}")
-        plt.close(fig1)
-    else:
-        plt.show()
-
-    # **Plot 2: Without Snapshots**
-    fig2, ax2 = plt.subplots(figsize=(8, 6))
-
-    # Plot only source, intermediates, and target
-    ax2.scatter(X1_vis[:, 0], X1_vis[:, 1], color=color_map[source_t], alpha=1.0, s=8,  zorder = 15, label=f'Time {source_t} (Training Data)')
-    #ax2.scatter(Xm_vis[:, 0], Xm_vis[:, 1], color=color_map[middle_t], alpha=1.0, s=10,  zorder = 10, label=f'Time {middle_t}')
-    ax2.scatter(X2_vis[:, 0], X2_vis[:, 1], color=color_map[target_t], alpha=1.0, s=8,  zorder = 10, label=f'Time {target_t} (Training Data)')
-
-    # Set labels and title
-    ax2.set_xlabel("PC 1", fontsize = 20)
-    ax2.set_ylabel("PC 2", fontsize = 20)
-    ax2.tick_params(axis='both', which='major', labelsize=20)  # Increase tick sizes
-    #ax2.legend(loc='upper right', fontsize='small')
-    ax2.set_title("")
-
-    # Save or show the plot
-    if output_file_without_snapshots:
-        plt.savefig(output_file_without_snapshots, dpi=300, bbox_inches='tight')
-        print(f"Static trajectory plot WITHOUT snapshots saved to {output_file_without_snapshots}")
-        plt.close(fig2)
-    else:
-        plt.show()
-
-                                                
-def generate_static_trajectory_plots_cell_types(pca,days,cell_types_by_day,mats, output_file_cell_type_source=None, output_file_cell_type_target=None, output_file_cell_type_legend=None):
-    """
-    Generate two static trajectory plots:
-    1. With snapshots from X1_trpts using a color gradient.
-    2. Without snapshots, showing only main time points.
-    """
-
-    source_t, middle_t, target_t = days[0], days[1], days[-1]
-    
-    # Define colors for time points
-    color_map = {
-        source_t: '#1f77b4',  # Blue
-        #intermediate_days[0]: '#ff7f0e',  # Orange
-        target_t: '#d62728'  # Red
-    }
-
-    # **Plot 1: With Snapshots**
-
-    # Same PCA transformation and cell type extraction as before
-    X1_vis = pca.transform(mats[source_t])
-    X2_vis = pca.transform(mats[target_t])
-    cell_types_X1 = cell_types_by_day[source_t]
-    cell_types_X2 = cell_types_by_day[target_t]
-    unique_cell_types = np.unique(np.concatenate([cell_types_X1, cell_types_X2]))
-    cell_type_palette = dict(zip(unique_cell_types, sns.color_palette("tab20", len(unique_cell_types))))
-    
-    # -----------------------
-    # Plot 1: X1 colored, X2 gray (no legend)
-    fig1, ax1 = plt.subplots(figsize=(8, 6))
-    ax1.scatter(X2_vis[:, 0], X2_vis[:, 1], color='lightgray', alpha=0.5, s=8)
-    for cell_type in unique_cell_types:
-        idx = cell_types_X1 == cell_type
-        ax1.scatter(X1_vis[idx, 0], X1_vis[idx, 1], 
-                    color=cell_type_palette[cell_type], s=8, alpha=1.0)
-    ax1.set_xlabel("PC 1", fontsize=20)
-    ax1.set_ylabel("PC 2", fontsize=20)
-    ax1.tick_params(axis='both', which='major', labelsize=18)
-    ax1.set_title(f"Untreated Samples colored by Cell Type", fontsize=18)
-    plt.tight_layout()
-    if output_file_cell_type_source:
-        plt.savefig(output_file_cell_type_source, dpi=300, bbox_inches='tight')
-        plt.close(fig1)
-    else:
-        plt.show()
-    
-    # -----------------------
-    # Plot 2: X2 colored, X1 gray (no legend)
-    fig2, ax2 = plt.subplots(figsize=(8, 6))
-    ax2.scatter(X1_vis[:, 0], X1_vis[:, 1], color='lightgray', alpha=0.5, s=8)
-    for cell_type in unique_cell_types:
-        idx = cell_types_X2 == cell_type
-        ax2.scatter(X2_vis[idx, 0], X2_vis[idx, 1], 
-                    color=cell_type_palette[cell_type], s=8, alpha=1.0)
-    ax2.set_xlabel("PC 1", fontsize=20)
-    ax2.set_ylabel("PC 2", fontsize=20)
-    ax2.tick_params(axis='both', which='major', labelsize=18)
-    ax2.set_title(f"Treated Samples colored by Cell Type", fontsize=18)
-    plt.tight_layout()
-    if output_file_cell_type_target:
-        plt.savefig(output_file_cell_type_target, dpi=300, bbox_inches='tight')
-        plt.close(fig2)
-    else:
-        plt.show()
-
-        
-
-    # Use circle markers instead of patches for legend
-    legend_elements = [
-        mlines.Line2D(
-            [], [], marker='o', color='w',
-            markerfacecolor=cell_type_palette[cell_type],
-            markersize=8, label=cell_type
-        )
-        for cell_type in unique_cell_types
-    ]
-    
-    # Create circle markers for legend entries
-    legend_elements = [
-        mlines.Line2D(
-            [], [], marker='o', color='w',
-            markerfacecolor=cell_type_palette[cell_type],
-            markersize=8, label=cell_type
-        )
-        for cell_type in unique_cell_types
-    ]
-    
-    # Create figure and axis (just for the legend)
-    fig_leg, ax_leg = plt.subplots()
-    fig_leg.set_figwidth(8)  # Initial size; will be adjusted
-    fig_leg.set_figheight(6)
-    
-    # Hide axes
-    ax_leg.axis('off')
-    
-    # Add legend to axis (not directly to plt)
-    legend = ax_leg.legend(
-        handles=legend_elements,
-        loc='center',
-        frameon=True,
-        fontsize=14,
-        ncol=1,
-        title='Cell Types',
-        title_fontsize=14,
-        borderpad=1
-    )
-    
-    # Resize the figure to tightly fit the legend
-    fig_leg.canvas.draw()
-    bbox = legend.get_window_extent().transformed(fig_leg.dpi_scale_trans.inverted())
-    fig_leg.set_size_inches(bbox.width + 0.5, bbox.height + 0.5)  # Add a little padding
-    
-    # Save only, no display
-    if output_file_cell_type_legend:
-        plt.savefig(output_file_cell_type_legend, dpi=300, bbox_inches='tight')
-        plt.close(fig_leg)
-    
-## Statitc Plots of Subtrajectories
-
-def generate_static_cluster_plot_target(pca,
-    source_t, target_t, X1_trpts, mats, optimal_k, start_i, index,p, reverse=False, intermediate_t=[1,2,3], 
-    d_red=2, random_state=42, exp_memo='experiment', output_file = None
-):
-    """
-    Generate a static plot of all snapshots from X1_trpts, colored by sub-trajectories.
-    
-    Parameters:
-    - pca - a two dimensional pca
-    - source_t (int): Source time step.
-    - target_t (int): Target time step.
-    - X1_trpts: list of cell positions over time generated by velocity field
-    - Mats:  dictionary that groups gene expression data by timepoint.
-    - optimal_k (int): Number of clusters.
-    - start_i (int): Starting index for X1_trpts.
-    - index (int): Step size for selecting snapshots.
-    -p: velocity model parameters
-    - reverse (bool): Whether to reverse trajectory direction.
-    - intermediate_t (list): List of intermediate time points.
-    - d_red (int): PCA dimension reduction.
-    - random_state (int): Random seed for clustering.
-    - exp_memo (str): Experiment identifier for file naming.
-    - output_file: The output filepath for the graph
-    """
-    
-    
-
-    # Compute trajectory integration
-    dt = p['numerical_ts'][-1] / 200
-    
- 
-    # Perform clustering on last day's cell states
-    last_day = mats[target_t]
-    last_day_reduced = pca.transform(last_day).astype(np.float32)
-    
-    kmeans = KMeans(n_clusters=optimal_k, random_state=random_state)
-    kmeans.fit(last_day_reduced)
-    last_day_labels = kmeans.labels_
-
-    # Classify final predicted states
-    X1_hat_last = X1_trpts[-1].astype(np.float32)
-    X1_hat_labels = kmeans.predict(X1_hat_last)
-
-    # Define colors for each cluster
-    default_colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown']
-    subgroup_colors_blue = {label: default_colors[i] for i, label in enumerate(np.unique(X1_hat_labels))}
-    subgroup_colors_red = {label: default_colors[i] for i, label in enumerate(np.unique(last_day_labels))}
-
-   
-    
-
-    # Create figure
-    fig, ax = plt.subplots(figsize=(8, 6))
-
-    # Plot last day's clusters (target) in gray as actual data
-    X2_vis = pca.transform(mats[target_t])
-    ax.scatter(X2_vis[:, 0], X2_vis[:, 1], color='lightgray', alpha=0.7, s=10, zorder=10, label='Data')
-        
-    # Plot transported states (X1_hat) using assigned cluster colors (predicted sub-trajectories)
-    for i, X1_trpt in enumerate(X1_trpts):
-        if i % index == 0 and i >= start_i:
-            if np.isnan(X1_trpt).any():
-                continue
-            X1_hat_vis = X1_trpt
-    
-            for label in np.unique(X1_hat_labels):
-                idx = (X1_hat_labels == label)
-    
-                # Scatter Plot: Individual Points
-                ax.scatter(X1_hat_vis[idx, 0], X1_hat_vis[idx, 1],
-                           c=subgroup_colors_blue[label], alpha=0.75, s=3, zorder=1,
-                           label=f'Predicted Subtrajectory {label+1}' if i == start_i else None)
-    
-                # **Line Plot: Connect Points from Previous Iteration**
-                if i > start_i:  # Ensure there's a previous iteration
-                    prev_X1_hat_vis = X1_trpts[i - index]  # Get previous iteration
-                    prev_idx = (X1_hat_labels == label)
-    
-                    ax.plot([prev_X1_hat_vis[prev_idx, 0], X1_hat_vis[idx, 0]],
-                            [prev_X1_hat_vis[prev_idx, 1], X1_hat_vis[idx, 1]],
-                            color=subgroup_colors_blue[label], alpha=0.5, linewidth=1, zorder=0)
-
-    
-    # Plot source and intermediate days in gray circles (empty)
-    X1_vis = pca.transform(mats[source_t])
-    ax.scatter(X1_vis[:, 0], X1_vis[:, 1], color='lightgray', alpha=0.7, s=10, zorder=10)
-    
-    for t in intermediate_t:
-        X_intermediate_vis = pca.transform(mats[t])
-        ax.scatter(X_intermediate_vis[:, 0], X_intermediate_vis[:, 1],
-                   color='lightgray', alpha=0.7, s=10, zorder=10)
-    
-    # Set labels and title
-    ax.set_xlabel("PC 1", fontsize = 24)
-    ax.set_ylabel("PC 2", fontsize = 24)
-    ax.tick_params(axis='both', which='major', labelsize=24)  # Increases tick font size
-    ax.set_title("")
-    
-    # Add custom legend
-    handles, labels = ax.get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))
-    #ax.legend(by_label.values(), by_label.keys(), loc='upper right', fontsize='24')
-    
-    # Save or show the plot
-    plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"Static cluster plot saved to {output_file}")
-    plt.close(fig)
-
-
-    return X1_hat_labels
-
-
-
-
-def generate_static_cluster_plot_source(
-    pca,
-    source_t, target_t, X1_trpts, mats, optimal_k, start_i, index,p, reverse=False, intermediate_t=[1,2,3], 
-    d_red=2, random_state=42, exp_memo='experiment', output_file = None
-):
-    """
-    Generate a static plot of all snapshots from X1_trpts, colored by sub-trajectories.
-    
-    Parameters:
-    - pca - a two dimensional pca
-    - source_t (int): Source time step.
-    - target_t (int): Target time step.
-    - X1_trpts: list of cell positions over time generated by velocity field
-    - Mats:  dictionary that groups gene expression data by timepoint.
-    - optimal_k (int): Number of clusters.
-    - start_i (int): Starting index for X1_trpts.
-    - index (int): Step size for selecting snapshots.
-    -p: velocity model parameters
-    - reverse (bool): Whether to reverse trajectory direction.
-    - intermediate_t (list): List of intermediate time points.
-    - d_red (int): PCA dimension reduction.
-    - random_state (int): Random seed for clustering.
-    - exp_memo (str): Experiment identifier for file naming.
-    - output_file: The output filepath for the graph
-    """
-    
-
-    # Compute trajectory integration
-    dt = p['numerical_ts'][-1] / 200
-   
-    # Perform clustering on last day's cell states
-    last_day = mats[source_t]
-    last_day_reduced = pca.transform(last_day).astype(np.float32)
-    
-    kmeans = KMeans(n_clusters=optimal_k, random_state=random_state)
-    kmeans.fit(last_day_reduced)
-    last_day_labels = kmeans.labels_
-
-    # Classify final predicted states
-    X1_hat_last = X1_trpts[0].astype(np.float32)
-    X1_hat_labels = kmeans.predict(X1_hat_last)
-
-    # Define colors for each cluster
-    default_colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown']
-    subgroup_colors_blue = {label: default_colors[i] for i, label in enumerate(np.unique(X1_hat_labels))}
-    subgroup_colors_red = {label: default_colors[i] for i, label in enumerate(np.unique(last_day_labels))}
-
-
-    # Create figure
-    fig, ax = plt.subplots(figsize=(8, 6))
-
-    # Plot last day's clusters (target) in red subgroup colors
-   # Plot last day's clusters (target) in gray as actual data
-    X2_vis = pca.transform(mats[target_t])
-    ax.scatter(X2_vis[:, 0], X2_vis[:, 1], facecolors='none', edgecolors='gray', linewidths=0.7, alpha=0.7, s=10, zorder=10, label='Data')
-
-
-    # Plot transported states (X1_hat) using assigned cluster colors (predicted sub-trajectories)
-    for i, X1_trpt in enumerate(X1_trpts):
-        if i % index == 0 and i >= start_i:
-            if np.isnan(X1_trpt).any():
-                continue
-            X1_hat_vis = X1_trpt
-            for label in np.unique(X1_hat_labels):
-                idx = (X1_hat_labels == label)
-                ax.scatter(X1_hat_vis[idx, 0], X1_hat_vis[idx, 1],
-                           c=subgroup_colors_blue[label], alpha=0.75, s=3, zorder=1,
-                           label=f'Predicted Subtrajectory {label+1}' if i == start_i else None) 
-                
-
-    # Plot source day
-    X1_vis = pca.transform(mats[source_t])
-    ax.scatter(X1_vis[:, 0], X1_vis[:, 1], facecolors='none', edgecolors='gray', linewidths=0.7,  alpha=0.7, s=10, zorder = 10, label=f'Source: Day {source_t}')
-
-    # Plot intermediate time points
-    for t in intermediate_t:
-        X_intermediate_vis = pca.transform(mats[t])
-        ax.scatter(X_intermediate_vis[:, 0], X_intermediate_vis[:, 1], facecolors='none', edgecolors='gray', linewidths=0.7,  alpha=0.7, s=10, zorder = 10, label=f'Intermediate: Day {t}')
-
-    # Set labels, legend, and title
-    ax.set_xlabel("PC 1", fontsize = 24)
-    ax.set_ylabel("PC 2", fontsize = 24)
-    ax.tick_params(axis='both', which='major', labelsize=24)  # Increases tick font size
-    ax.set_title("")
-
-    # Save or show the plot
-    plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"Static cluster plot saved to {output_file}")
-    plt.close(fig)
-
-    return X1_hat_labels
-
-
-
-
-
-def classify_X1_hat(full_matrix,pca,source_t, target_t,X1_trpts,mats, optimal_k, start_i, index,p, reverse=True, intermediate_t=[1], 
-    d_red=2, random_state=42, exp_memo='2', output_file = None,output_file_2 = None):
-    
-
-    dt = p['numerical_ts'][-1] / 200
-    
-
     physical_dt = dt * p['ts'][-1] / p['numerical_ts'][-1]
-
+    
     intermediate_t = np.array(intermediate_t)
+    
     if len(intermediate_t) == 0:
         intermediate_t = range(source_t+1, target_t)
-
+        
+    # data parameters
     day1, day2 = source_t, target_t
 
-    # Perform clustering analysis on the last day's cell states
+    X1_trpt = X1_trpts[-1]
+    
+    
+    contrast_colors = [
+    '#1f77b4',  # blue
+    '#2ca02c',  # green
+    '#ff7f0e',  # orange
+    '#8c564b',  # brown
+    '#d62728',  # red 
+    '#9467bd'  # purple (to be used for index 8)
+    ]
+
+    # Create a color mapping for the specific indices
+
+    # Step 1: Perform clustering analysis on the last day's cell states from mats
+    last_day = mats[day2]
+
+    last_day_reduced = pca.transform(last_day).astype(np.float32)
+    
+    # Perform KMeans clustering with the optimal number of clusters
+    kmeans = KMeans(n_clusters=optimal_k, random_state=40)
+    kmeans.fit(last_day_reduced)
+    last_day_labels = kmeans.labels_
+    
+    # Load previously saved cluster labels
+    #cluster_save_path = f"{result_dir}{exp_memo}_X1_hat_clusters.csv"
+    if not os.path.exists(cluster_save_path):
+        raise FileNotFoundError(f"Cluster labels file not found: {cluster_save_path}")
+    
+    df_clusters = pd.read_csv(cluster_save_path)
+    X1_hat_labels = df_clusters["Cluster_Label"].values  # Load saved labels
+
+    # Print the number of unique labels in last_day_labels
+    unique_labels = np.unique(X1_hat_labels)
+    print(f"Number of unique labels in X1_hat_labels: {len(unique_labels)}")
+    print(f"Unique labels: {unique_labels}")
+    
+    
+    # Define a function to create colors for the subgroups using a predefined set of colors
+    def get_subgroup_colors(labels, colors):
+        unique_labels = np.unique(labels)
+        if len(colors) < len(unique_labels):
+            raise ValueError("Not enough colors for the number of unique labels.")
+        subgroup_colors = {label: colors[i] for i, label in enumerate(unique_labels)}
+        return subgroup_colors
+
+    # Define specific sets of colors for the blue and red subgroups
+    blue_colors = ['#1f77b4', '#878ceb', '#104E8B', '#87CEEB', '#4682B4', '#6495ED', '#5F9EA0']  # Add more shades of blue as needed
+    red_colors = ['#d62728',  '#eb8787', '#FF4500', '#DC143C', '#FF6347', '#B22222', '#8B0000']  # Add more shades of red as needed
+    light_red_colors = ['#f99fa1', '#ffb1b1', '#ffaf86', '#f48585', '#ffb5a5', '#ff9c9c', '#ff5f5f']
+    
+    # Get the subgroup colors based on the labels
+    subgroup_colors_blue = get_subgroup_colors(X1_hat_labels, blue_colors)
+    subgroup_colors_red = get_subgroup_colors(X1_hat_labels, red_colors)
+
+    #mask = last_day_labels == 0
+    
+    
+    # Extract the gene index for the gene of interest
+    gene_index = list(gene_names).index(gene_of_interest)
+    
+    # Extract gene expression values from mats[day1], intermediate time points, and mats[day2]
+    X1_vis_pca = pca.transform(mats[source_t])
+    X1_vis_i_pca = pca.inverse_transform(X1_vis_pca)
+    X2_vis_pca = pca.transform(mats[target_t])
+    X2_vis_i_pca = pca.inverse_transform(X2_vis_pca)
+
+    gene_expression_X1 = X1_vis_i_pca[:, gene_index]
+    gene_expression_X2 = X2_vis_i_pca[:, gene_index]
+
+    gene_expression_intermediates = []
+    for t in intermediate_t:
+        X1_intermediate_vis_pca = pca.transform(mats[t])
+        X1_intermediate_vis_i_pca = pca.inverse_transform(X1_intermediate_vis_pca)
+        gene_expression_intermediates.append(X1_intermediate_vis_i_pca[:, gene_index])
+
+    # Extract gene expression values from X1_trpts based on the given condition
+    
+    gene_expression_X1_trpts = np.concatenate([pca.inverse_transform(X1_trpt)[:, gene_index] for i, X1_trpt in enumerate(X1_trpts) if i % index == 0 and i <= max_i])
+    
+    # Combine all gene expression values
+    all_gene_expression_values = np.concatenate([gene_expression_X1, *gene_expression_intermediates, gene_expression_X2, gene_expression_X1_trpts])
+
+    gene_expression_X1_normalized = gene_expression_X1
+    gene_expression_intermediates_normalized = gene_expression_intermediates
+    gene_expression_X2_normalized = gene_expression_X2
+    gene_expression_X1_trpts_normalized = gene_expression_X1_trpts
+    
+    vmin = all_gene_expression_values.min()
+    vmax = all_gene_expression_values.max()
+    
+    # Plot dynamics for X1_trpts with subgroup colors
+    indices = range(len(X1_trpts))
+
+    all_gene_expression_values_normalized_X1 = gene_expression_X1_trpts_normalized
+    
+
+    
+    # (1) Plot the averaged gene expressions across X1_trpt at each time point with confidence intervals
+    
+    # Compute the average gene expression and confidence intervals
+    avg_gene_expressions = []
+    ci_gene_expressions = []
+    
+    # Reset normalized gene expression values for X1_trpts
+    all_gene_expression_values_normalized_X1 = gene_expression_X1_trpts_normalized
+    
+    # Use indices with the specified step size defined by `index`
+    indices = range(0, len(X1_trpts), index)
+
+    
+    # Iterate through indices to compute averages and confidence intervals
+    for i in indices:
+        if i > max_i:  # Apply truncation based on max_i
+            break
+        X1_trpt = X1_trpts[i]
+        if np.isnan(X1_trpt).any():
+            break
+    
+        # Inverse transform the current trajectory
+        X1_hat = pca.inverse_transform(X1_trpt)
+    
+        # Extract gene expression values for the current step
+        gene_expression_values = all_gene_expression_values_normalized_X1[:len(X1_hat)]
+        all_gene_expression_values_normalized_X1 = all_gene_expression_values_normalized_X1[len(X1_hat):]  # Update to exclude used values
+    
+        # Compute average and confidence interval
+        avg_gene_expressions.append(np.mean(gene_expression_values))
+        ci = stats.sem(gene_expression_values) * stats.t.ppf((1 + 0.95) / 2., len(gene_expression_values) - 1)
+        ci_gene_expressions.append(ci)
+    
+    # Process intermediate time points
+    intermediate_avg_expressions = []
+    intermediate_ci_expressions = []
+    intermediate_indices = []
+
+
+    for idx, t in enumerate(intermediate_t):
+        gene_expression_intermediate = gene_expression_intermediates_normalized[idx]
+        intermediate_avg_expressions.append(np.mean(gene_expression_intermediate))
+        ci = stats.sem(gene_expression_intermediate) * stats.t.ppf((1 + 0.95) / 2., len(gene_expression_intermediate) - 1)
+        intermediate_ci_expressions.append(ci)
+    
+        # Rescale the intermediate time points to align with `index`
+        shifted_value_1 = intermediate_t - 1
+        shifted_value_2 = intermediate_t[0] - 1
+        shifted_t_1 = t - shifted_value_1
+        shifted_t_2 = t - shifted_value_2
+        time_index = int((float(shifted_t_2) / (float(max(shifted_t_1)) + 1)) * len(indices))
+        intermediate_indices.append(time_index)
+
+    
+    # Include first and last time points
+    all_avg_expressions = [np.mean(gene_expression_X1_normalized)] + intermediate_avg_expressions + [np.mean(gene_expression_X2_normalized)]
+    all_ci_expressions = [
+        stats.sem(gene_expression_X1_normalized) * stats.t.ppf((1 + 0.95) / 2., len(gene_expression_X1_normalized) - 1)
+    ] + intermediate_ci_expressions + [
+        stats.sem(gene_expression_X2_normalized) * stats.t.ppf((1 + 0.95) / 2., len(gene_expression_X2_normalized) - 1)
+    ]
+
+        
+    all_indices = [0] + intermediate_indices + [len(indices)]
+    combined_indices = sorted([day1] + intermediate_t.tolist() + [day2])
+
+    print(combined_indices)
+
+    
+    # Ensure extended_indices align with avg_gene_expressions
+    extended_indices = np.array([x * index for x in range(len(avg_gene_expressions))])
+    
+    # Ensure all_indices and extended_indices are NumPy arrays
+    combined_indices = np.array(combined_indices)
+    extended_indices = np.array(extended_indices)
+    
+    # Linearly rescale all_indices to be equally distributed in extended_indices
+    rescaled_indices = np.interp(
+        combined_indices,  # Original indices
+        [combined_indices[0], combined_indices[-1]],  # Range of all_indices
+        [extended_indices[0], extended_indices[-1]]  # Range of extended_indices
+    )
+
+
+
+
+    
+    # (1) Perform clustering on the last day's cell states from `mats`
     last_day = mats[day2]
     last_day_reduced = pca.transform(last_day).astype(np.float32)
-
-    kmeans = KMeans(n_clusters=optimal_k, random_state=42)
+    
+    # Perform KMeans clustering
+    kmeans = KMeans(n_clusters=optimal_k, random_state=40)
     kmeans.fit(last_day_reduced)
     last_day_labels = kmeans.labels_
-
-    X1_hat_last = X1_trpts[-1].astype(np.float32)
-    X1_hat_labels = kmeans.predict(X1_hat_last)
-
-    # Generate colors for clusters
-    default_colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown']
-    viridis_colors = default_colors[:optimal_k]
-
-    def get_subgroup_colors(labels, colors):
-        unique_labels = np.unique(labels)
-        subgroup_colors = {label: colors[i] for i, label in enumerate(unique_labels)}
-        return subgroup_colors
-
-    subgroup_colors_blue = get_subgroup_colors(X1_hat_labels, viridis_colors)
-    subgroup_colors_red = get_subgroup_colors(last_day_labels, viridis_colors)
-
-    # Define filename paths
-    direction = 'backward' if reverse else 'forward'
-    img_src = output_file
-    initial_img_src = output_file_2
-    # img_src = f"{output_dir}{exp_memo}-movie-cluster-{optimal_k}-{direction}-trajectory.gif"
-    # initial_img_src = os.path.join(output_dir, f"{exp_memo}_initial_state_with_background.png")  # NEW STATIC FIGURE
-
-    # Plot initial state for animation
-    fig, ax = plt.subplots()
-    ims = []
-
-    # Prepare Data for Initial State
-    reducer = decomposition.PCA(n_components=2, random_state=0)
-    reducer.fit(full_matrix)
-    vis_all_days = reducer.transform(full_matrix)
-    
-    X1_vis = reducer.transform(mats[day1])
-    X2_vis = reducer.transform(mats[day2])
-
-    # **(1) Save the Initial State Figure with Black Circle Outlines**
-    fig_init, ax_init = plt.subplots(figsize=(8, 6))
-    
-    # Plot background gray cells
-    ax_init.scatter(vis_all_days[:, 0], vis_all_days[:, 1], color='lightgray', alpha=1.0, s=8.0, zorder=5)
-    
-    # Plot last day's clusters **with black outline**
-    scatter = ax_init.scatter(X2_vis[:, 0], X2_vis[:, 1], 
-                              c=[subgroup_colors_red[label] for label in last_day_labels], 
-                              alpha=1.0, s=50, edgecolors='black', linewidth=1.5, zorder=8)
-    
-    # Axis Labels
-    ax_init.set_xlabel("PC 1", fontsize=24)
-    ax_init.set_ylabel("PC 2", fontsize=24)
-    ax_init.tick_params(axis='both', which='major', labelsize=24)
-    ax_init.set_title("", fontsize=16)
-    
-    # Save the static figure
-    plt.savefig(initial_img_src, dpi=300, bbox_inches="tight")
-    plt.close()
     
 
-    # **(2) Create a Separate Figure for the Legend**
-    fig_legend, ax_legend = plt.subplots(figsize=(10, 2))  # Wider aspect ratio for horizontal layout
-    ax_legend.axis("off")  # Hide axes
     
-    # Get unique labels
-    unique_labels = np.unique(last_day_labels)
+    # Define colors for subgroups
+    subgroup_colors = ["teal","magenta","orange","navy","gold"]
+    unique_labels = np.unique(X1_hat_labels)
+    subgroup_color_map = {label: subgroup_colors[i % len(subgroup_colors)] for i, label in enumerate(unique_labels)}
     
-    # Define legend elements:
-    legend_elements = []
+    # Define filename
+    subgroup_output_file = img_src
     
-    # (A) **Fate Labels (Bold Dots with Black Outlines)**
+    # (2) Initialize Storage for Mean and CI
+    subgroup_avg_gene_expressions = {label: [] for label in unique_labels}
+    subgroup_ci_gene_expressions = {label: [] for label in unique_labels}
+    
+    all_gene_expression_values_normalized_X1 = gene_expression_X1_trpts_normalized.copy()
+    
+    # (3) Compute Mean & Confidence Intervals
+    for i, time_idx in enumerate(indices):
+        if time_idx > max_i:  # Apply truncation
+            break
+        X1_trpt = X1_trpts[time_idx]
+        if np.isnan(X1_trpt).any():
+            break
+    
+        # Extract gene expression values
+        X1_hat = pca.inverse_transform(X1_trpt)
+        gene_expression_values = all_gene_expression_values_normalized_X1[:len(X1_hat)]
+        all_gene_expression_values_normalized_X1 = all_gene_expression_values_normalized_X1[len(X1_hat):]
+    
+        # Compute subgroup averages & CI
+        for label in unique_labels:
+            mask = (X1_hat_labels == label)  # Use labels **only from step 1**
+            subgroup_values = np.array(gene_expression_values)[mask]
+    
+            if len(subgroup_values) > 0:
+                subgroup_avg_gene_expressions[label].append(np.mean(subgroup_values))
+                ci = stats.sem(subgroup_values) * stats.t.ppf((1 + 0.95) / 2., len(subgroup_values) - 1)
+                subgroup_ci_gene_expressions[label].append(ci)
+            else:
+                subgroup_avg_gene_expressions[label].append(np.nan)
+                subgroup_ci_gene_expressions[label].append(np.nan)
+    
+
+            
+    
+    # (4) **Plot**
+    fig, ax1 = plt.subplots(figsize=(12, 7))
+    
+    # **Get x-axis positions for the line plot (scale to [0, 4])**
+    num_points = len(next(iter(subgroup_avg_gene_expressions.values())))  # Number of time points
+    x_positions = np.linspace(0, 4, num_points)  # Ensure correct x-spacing for trajectories
+    
+    # **Plot Predicted Trajectories & Confidence Intervals**
+    subgroup_legend_handles = []  # Store for separate legend
+
+
+    # **Plot Subgroup Averages & Confidence Intervals**
     for i, label in enumerate(unique_labels):
-        legend_elements.append(
-            mlines.Line2D([], [], color=subgroup_colors_red[label], marker='o', linestyle='None', markersize=12, 
-                          markeredgecolor='black', markeredgewidth=3.0, label=f"Fate {i+1}")
+        # **Plot the Mean Trajectory Line**
+        line, = ax1.plot(
+            x_positions, subgroup_avg_gene_expressions[label], zorder=10,
+            linestyle='-', color=subgroup_color_map[label], linewidth=2,
+            label=f'Predicted Trajectory {i+1}'
         )
     
-    # (B) **Predicted Trajectories (One Dot with a Centered Horizontal Bar)**
-    for i, label in enumerate(unique_labels):
-        # Single dot with a horizontal bar
-        trajectory_dot_bar = mlines.Line2D([], [], color=subgroup_colors_red[label], marker='o', linestyle='-', 
-                                           markersize=6, linewidth=2, alpha=1.0, label=f"Trajectory {i+1}")
-    
-        # Add to legend
-        legend_elements.append(trajectory_dot_bar)
-    
-    # Create horizontal legend **with a frame**
-    ax_legend.legend(
-        handles=legend_elements,
-        loc="center", fontsize=20, title="Cell Fates & Predicted Trajectories",
-        title_fontsize=20, ncol=4, frameon=True, framealpha=1.0, edgecolor="black", handletextpad=1.0, columnspacing=1.0
-    )
-    
-    # Save the legend figure
-    legend_img_src = initial_img_src.replace(".png", "_legend.png")
-    plt.savefig(legend_img_src, dpi=300, bbox_inches="tight")
-    plt.close()
-    
-
-
-    # Animation: Initial frame
-    im = ax.scatter(X2_vis[:, 0], X2_vis[:, 1], 
-                    c=[subgroup_colors_red[label] for label in last_day_labels], 
-                    alpha=1.0, s=3.0, zorder=8)
-
-    ttl = ax.text(0.5, 1.05, "t = %.3f" % (0), 
-                  bbox={'facecolor': 'w', 'alpha': 0.5, 'pad': 5}, 
-                  transform=ax.transAxes, ha="center")
-
-    ims.append([im, ttl])
-
-    # Animation: Trajectory updates
-    indices = range(len(X1_trpts) - start_i)
-    if reverse:
-        indices = reversed(indices)
-
-    for i in indices:
-        if i % index == 0:
-            X1_trpt = X1_trpts[i]
-            if np.isnan(X1_trpt).any():
-                break
-            X1_hat = pca.inverse_transform(X1_trpt)
-            X1_hat_vis = reducer.transform(X1_hat)
-
-            im = ax.scatter(X1_hat_vis[:, 0], X1_hat_vis[:, 1], 
-                            c=[subgroup_colors_blue[label] for label in X1_hat_labels], 
-                            alpha=1.0, s=3.0, zorder=10)
-            
-            ax.scatter(X2_vis[:, 0], X2_vis[:, 1], 
-                       c=[subgroup_colors_red[label] for label in last_day_labels], 
-                       alpha=1.0, s=3.0, zorder=8)
-
-            # Keep background cells in the animation
-            ax.scatter(vis_all_days[:, 0], vis_all_days[:, 1], color='lightgray', alpha=1.0, s=0.5, zorder=5)
-
-            ttl = ax.text(0.5, 1.05, "t = %.3f" % (physical_dt * i), 
-                          bbox={'facecolor': 'w', 'alpha': 0.5, 'pad': 5}, 
-                          transform=ax.transAxes, ha="center")
-
-            ims.append([im, ttl])
-
-    ani = animation.ArtistAnimation(fig, ims, interval=50, blit=True, repeat_delay=200)
-    writergif = animation.PillowWriter(fps=3)
-    ani.save(img_src, writer=writergif)
-    plt.clf()
-    
-    # Display saved animation
-    display(Image(filename=img_src))
-
-    print(f"Initial state figure (with background) saved at: {initial_img_src}")
-    print(f"Animation saved at: {img_src}")
-
-
-
-
-
-def classify_X2_hat(
-    full_matrix,pca,source_t, target_t,X1_trpts,mats, optimal_k, start_i, index,p, reverse=True, intermediate_t=[1], 
-    d_red=2, random_state=42, exp_memo='2', output_file = None,output_file_2 = None):
-    
-   
-
-    dt = p['numerical_ts'][-1] / 200
-   
-    physical_dt = dt * p['ts'][-1] / p['numerical_ts'][-1]
-
-    intermediate_t = np.array(intermediate_t)
-    if len(intermediate_t) == 0:
-        intermediate_t = range(source_t+1, target_t)
-
-    day1, day2 = source_t, target_t
-
-    # Perform clustering analysis on the last day's cell states
-    last_day = mats[day1]
-    last_day_reduced = pca.transform(last_day).astype(np.float32)
-
-    kmeans = KMeans(n_clusters=optimal_k, random_state=42)
-    kmeans.fit(last_day_reduced)
-    last_day_labels = kmeans.labels_
-
-    X1_hat_last = X1_trpts[0].astype(np.float32)
-    X1_hat_labels = kmeans.predict(X1_hat_last)
-
-    # Generate colors for clusters
-    default_colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown']
-    viridis_colors = default_colors[:optimal_k]
-
-    def get_subgroup_colors(labels, colors):
-        unique_labels = np.unique(labels)
-        subgroup_colors = {label: colors[i] for i, label in enumerate(unique_labels)}
-        return subgroup_colors
-
-    subgroup_colors_blue = get_subgroup_colors(X1_hat_labels, viridis_colors)
-    subgroup_colors_red = get_subgroup_colors(last_day_labels, viridis_colors)
-
-    # Define filename paths
-    direction = 'backward' if reverse else 'forward'
-    img_src = output_file
-    initial_img_src = output_file_2
-    
-    # Plot initial state for animation
-    fig, ax = plt.subplots()
-    ims = []
-
-    reducer = decomposition.PCA(n_components=2, random_state=0)
-    reducer.fit(full_matrix)
-    vis_all_days = reducer.transform(full_matrix)
-    # Prepare Data for Initial State
-    X1_vis = reducer.transform(mats[day1])
-    X2_vis = reducer.transform(mats[day2])
-
-    # **(1) Save the Initial State Figure with Black Circle Outlines**
-    fig_init, ax_init = plt.subplots(figsize=(8, 6))
-    
-    # Plot background gray cells
-    ax_init.scatter(vis_all_days[:, 0], vis_all_days[:, 1], color='lightgray', alpha=1.0, s=8.0, zorder=5)
-    
-    # Plot last day's clusters **with black outline**
-    scatter = ax_init.scatter(X1_vis[:, 0], X1_vis[:, 1], 
-                              c=[subgroup_colors_red[label] for label in last_day_labels], 
-                              alpha=1.0, s=50, edgecolors='black', linewidth=1.5, zorder=8)
-    
-    # Axis Labels
-    ax_init.set_xlabel("PC 1", fontsize=24)
-    ax_init.set_ylabel("PC 2", fontsize=24)
-    ax_init.tick_params(axis='both', which='major', labelsize=24)
-    ax_init.set_title("", fontsize=16)
-    
-    # Save the static figure
-    plt.savefig(initial_img_src, dpi=300, bbox_inches="tight")
-    plt.close()
-    
-
-    # **(2) Create a Separate Figure for the Legend**
-    fig_legend, ax_legend = plt.subplots(figsize=(10, 2))  # Wider aspect ratio for horizontal layout
-    ax_legend.axis("off")  # Hide axes
-    
-    # Get unique labels
-    unique_labels = np.unique(last_day_labels)
-    
-    # Define legend elements:
-    legend_elements = []
-    
-    # (A) **Fate Labels (Bold Dots with Black Outlines)**
-    for i, label in enumerate(unique_labels):
-        legend_elements.append(
-            mlines.Line2D([], [], color=subgroup_colors_red[label], marker='o', linestyle='None', markersize=12, 
-                          markeredgecolor='black', markeredgewidth=3.0, label=f"Ancestor {i+1}")
+        # **Plot the Confidence Interval (Shaded Region)**
+        ax1.fill_between(
+            x_positions,
+            np.array(subgroup_avg_gene_expressions[label]) - np.array(subgroup_ci_gene_expressions[label]),
+            np.array(subgroup_avg_gene_expressions[label]) + np.array(subgroup_ci_gene_expressions[label]),
+            alpha=0.2, zorder=5, color=subgroup_color_map[label],
+            label=f'95% CI of Trajectory {i+1}'
         )
     
-    # (B) **Predicted Trajectories (One Dot with a Centered Horizontal Bar)**
-    for i, label in enumerate(unique_labels):
-        # Single dot with a horizontal bar
-        trajectory_dot_bar = mlines.Line2D([], [], color=subgroup_colors_red[label], marker='o', linestyle='-', 
-                                           markersize=6, linewidth=2, alpha=1.0, label=f"Trajectory {i+1}")
+        # **Legend entry for Mean + Confidence Interval**
+        ci_patch = mpatches.Patch(
+            color=subgroup_color_map[label], alpha=0.2, label=f'95% CI of Trajectory {i+1}'
+        )
     
-        # Add to legend
-        legend_elements.append(trajectory_dot_bar)
+        # **Store in Legend Handles**
+        subgroup_legend_handles.append(ci_patch)
+        subgroup_legend_handles.append(line)
+        
+    # (5) **Ensure Violin Plots are at `[0, 2, 4]`**
+    violin_data = [
+        gene_expression_X1_normalized,
+        *gene_expression_intermediates_normalized,
+        gene_expression_X2_normalized
+    ]
     
-    # Create horizontal legend **with a frame**
+    # **Manually set violin plot positions to `[0, 2, 4]`**
+    violin_x_positions = np.array([0, 1, 2, 3, 4])  # Explicitly define positions
+    violin_colors = ["black", "gray", "black", "gray", "black"]  # Set distinct colors
+    
+    # 🎻 **Plot Violin Plots One-by-One to Force Correct Positioning**
+    for i, (x_pos, data, color) in enumerate(zip(violin_x_positions, violin_data, violin_colors)):
+        violin_parts = sns.violinplot(
+            data=[data],  # Must be wrapped in a list to avoid merging violins
+            ax=ax1,
+            inner=None,
+            linewidth=1.2,
+            width=0.7,
+            cut=0,
+            scale="width",
+            color=color,  # ✅ Assign distinct colors
+            alpha=0.8,  # ✅ MAKE TRANSPARENT
+            zorder=3  # ✅ BRINGS VIOLINS TO THE FRONT
+        )
+        
+        # **Manually Adjust X-Position of Each Violin**
+        for violin in ax1.collections[-1:]:  # Only adjust the last added violin
+            for path in violin.get_paths():
+                path.vertices[:, 0] += x_pos - path.vertices[:, 0].mean()  # Move to correct x-location
+    
+    # **Expand x-axis limits to prevent cutting off last violin plot**
+    ax1.set_xlim(-0.5, 4.5)  # ✅ Extend range
+    
+    # 🛠 **Fix x-axis labels and ensure proper alignment**
+    ax1.set_xticks([0, 1, 2, 3, 4])  # ✅ Force labels at `[0, 2, 4]`
+    ax1.set_xticklabels([0, 1, 2, 3, 4], fontsize=35)
+    ax1.tick_params(axis='y', labelsize=35)
+    
+    ax1.set_xlabel('Time', fontsize=35)
+    ax1.set_ylabel('Gene Expression', fontsize=35)
+    ax1.set_title(f'Subtrajectory {gene_of_interest} Expression', fontsize=34)
+    
+    # 🎨 **Violin Plot Legend**
+    violin_legend_patches = [
+        mpatches.Patch(color="black", label="Input Data"),
+        mpatches.Patch(color="gray", label="Test Data")
+    ]
+    
+    # 🎨 **Create Separate Legend Figure (VERTICAL LAYOUT)**
+    fig_legend, ax_legend = plt.subplots(figsize=(4, 8))  # Tall aspect ratio for vertical layout
+    ax_legend.axis("off")  # Hide axes
+    
+    # **Combine both legends**
+    combined_legend = subgroup_legend_handles + violin_legend_patches
+    
     ax_legend.legend(
-        handles=legend_elements,
-        loc="center", fontsize=20, title="Cell Ancestors & Predicted Trajectories",
-        title_fontsize=20, ncol=4, frameon=True, framealpha=1.0, edgecolor="black", handletextpad=1.0, columnspacing=1.0
+        handles=combined_legend,
+        loc="center", fontsize=18, title="Trajectories & Violin Plots",
+        title_fontsize=18, ncol=1, frameon=True, handletextpad=1.5, columnspacing=2
     )
     
-    # Save the legend figure
-    legend_img_src = initial_img_src.replace(".png", "_legend.png")
-    plt.savefig(legend_img_src, dpi=300, bbox_inches="tight")
+    # Save the separate legend
+    legend_output_file = subgroup_output_file.replace(".png", "_legend.png")
+    plt.savefig(legend_output_file, dpi=300, bbox_inches='tight')
     plt.close()
     
-
-
-    # Animation: Initial frame
-    im = ax.scatter(X1_vis[:, 0], X1_vis[:, 1], 
-                    c=[subgroup_colors_red[label] for label in last_day_labels], 
-                    alpha=1.0, s=3.0, zorder=8)
-
-    ttl = ax.text(0.5, 1.05, "t = %.3f" % (0), 
-                  bbox={'facecolor': 'w', 'alpha': 0.5, 'pad': 5}, 
-                  transform=ax.transAxes, ha="center")
-
-    ims.append([im, ttl])
-
-    # Animation: Trajectory updates
-    indices = range(len(X1_trpts) - start_i)
-    if reverse:
-        indices = reversed(indices)
-
-    for i in indices:
-        if i % index == 0:
-            X1_trpt = X1_trpts[i]
-            if np.isnan(X1_trpt).any():
-                break
-            X1_hat = pca.inverse_transform(X1_trpt)
-            X1_hat_vis = reducer.transform(X1_hat)
-
-            im = ax.scatter(X1_hat_vis[:, 0], X1_hat_vis[:, 1], 
-                            c=[subgroup_colors_blue[label] for label in X1_hat_labels], 
-                            alpha=1.0, s=3.0, zorder=10)
-            
-            ax.scatter(X1_vis[:, 0], X1_vis[:, 1], 
-                       c=[subgroup_colors_red[label] for label in last_day_labels], 
-                       alpha=1.0, s=3.0, zorder=8)
-
-            # Keep background cells in the animation
-            ax.scatter(vis_all_days[:, 0], vis_all_days[:, 1], color='lightgray', alpha=1.0, s=0.5, zorder=5)
-
-            ttl = ax.text(0.5, 1.05, "t = %.3f" % (physical_dt * i), 
-                          bbox={'facecolor': 'w', 'alpha': 0.5, 'pad': 5}, 
-                          transform=ax.transAxes, ha="center")
-
-            ims.append([im, ttl])
-
-    ani = animation.ArtistAnimation(fig, ims, interval=50, blit=True, repeat_delay=200)
-    writergif = animation.PillowWriter(fps=3)
-    ani.save(img_src, writer=writergif)
-    plt.clf()
+    # 🎨 **Save the main figure without a legend**
+    plt.savefig(subgroup_output_file, dpi=300, bbox_inches='tight')
+    plt.close()
     
-    # Display saved animation
-    display(Image(filename=img_src))
+    print(f"Subgroup trajectory plot saved at: {subgroup_output_file}")
+    print(f"Legend plot saved separately at: {legend_output_file}")
 
-    print(f"Initial state figure (with background) saved at: {initial_img_src}")
-    print(f"Animation saved at: {img_src}")
+
+
+
