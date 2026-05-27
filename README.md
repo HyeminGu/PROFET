@@ -134,6 +134,9 @@ notebooks/<Dataset>.ipynb
 
 ### Data directory layout
 
+Raw datasets are available for download at:
+[https://drive.google.com/drive/folders/1ba-skCOxvosDQTWz1Rq3GlClk-NH8-eV](https://drive.google.com/drive/folders/1ba-skCOxvosDQTWz1Rq3GlClk-NH8-eV)
+
 Preprocessed datasets (`.pkl` files) are available for download at:
 [https://drive.google.com/drive/folders/1jrh3L8ZrHaGbSQDNA95ZXK383PaJvl9I?usp=drive_link](https://drive.google.com/drive/folders/1jrh3L8ZrHaGbSQDNA95ZXK383PaJvl9I?usp=drive_link)
 
