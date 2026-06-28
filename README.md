@@ -57,6 +57,17 @@ PROFET/                                  ← project root
 │   ├── Axolotl_data_2000.ipynb          ← Axolotl limb regeneration
 │   └── OU_process-GPA.ipynb             ← Ornstein-Uhlenbeck toy example
 │
+├── benchmarks/                          ← benchmark models for comparison
+│   ├── cellot/
+│   ├── DeepRUOT/
+│   ├── MIOFlow/
+│   ├── MMFM/
+│   ├── PI-SDE/
+│   ├── prescient/
+│   ├── TIGON/
+│   ├── TrajectoryNet/
+│   └── VGFM/
+│
 ├── data/                                ← raw data and preprocessed .pkl files
 │                                           (not included in the repository)
 ├── assets/                              ← outputs: GIFs, plots, model weights
@@ -200,16 +211,71 @@ Contains all downstream analysis and visualization functions, organized in two s
 - `classify_X1_hat` — animated fate classification
 - `classify_X2_hat` — animated ancestral classification
 
+## Benchmarks
+
+Nine trajectory inference methods are included under `benchmarks/` for comparison: 
+
+[cellot](https://github.com/bunnech/cellot), [DeepRUOT](https://github.com/zhenyiizhang/DeepRUOT), [MIOFlow](https://github.com/KrishnaswamyLab/MIOFlow), [MMFM](https://github.com/Genentech/MMFM), [PI-SDE](https://github.com/QiJiang-QJ/PI-SDE), [prescient](https://github.com/gifford-lab/prescient), [TIGON](https://github.com/yutongo/TIGON), [TrajectoryNet](https://github.com/krishnaswamylab/TrajectoryNet), [VGFM](https://github.com/DongyiWang-66/VGFM).
+
+
+### Benchmark datasets for reproducibility
+
+Figure 2 and Supplementary Table 4 compare performances of PROFET and benchmark models. All benchmark models are evaluated on a shared set of datasets. Each entry below lists the PCA dimensions tested and the models evaluated on that dataset.
+
+- **Stem cell differentiation (mESC)** — 456 cells, 100 genes; train on days 0, 2, 4; hold out days 1, 3
+  - Dimensions: 2, 4, 8, 16
+  - Models: MMFM, MIOFlow (PCA / GAE / PHATE), prescient, VGFM, DeepRUOT, PI-SDE, TIGON, TrajectoryNet
+
+- **EMT (72 genes)** — 12,588 cells; train on days 0, 4; hold out day 2 
+  - Dimensions: 2
+  - Models: MMFM, MIOFlow (PCA / GAE / PHATE), prescient, VGFM, DeepRUOT, PI-SDE, TIGON, TrajectoryNet, cellot
+
+- **LARRY benchmark (3,000 genes)** — 49,302 cells; train on days 2, 6; hold out day 4 
+  - Dimensions: 2
+  - Models: MMFM, MIOFlow (PCA / GAE / PHATE), prescient, VGFM, DeepRUOT, PI-SDE, TIGON, TrajectoryNet, cellot
+
+- **Axolotl limb regeneration (2,000 genes)** — 18,648 cells; train on days 0, 2, 4; hold out days 1, 3 
+  - Dimensions: 2
+  - Models: MMFM, MIOFlow (PCA / GAE / PHATE), prescient, VGFM, DeepRUOT, PI-SDE, TIGON
+  
+  
+Cellot is further evaluated on 2-time-points datasets.
+- **MCF7 breast cancer cell line** — 14,160 cells, 117 genes; day 0 → day 1, Dimensions: 2
+
+- **Patient 862** — 17,260 cells, 115 genes; day 0 → day 1, Dimensions: 2
+
+- **Patient 887** — 10,174 cells, 115 genes; day 0 → day 1, Dimensions: 2
+
+- **Patient PA3** — 4,692 cells, 116 genes; day 0 → day 1, Dimensions: 2
+
+
+### Reproducing benchmark results
+
+Each benchmark model has a `run.sh` script that lists all experiments. Data is loaded from the shared `data/` directory and results are saved to `assets/<model_name>/`.
+
+```bash
+cd benchmarks/<model_name>
+
+# Run all experiments for a model
+./run.sh
+
+# Run a single experiment by ID
+./run.sh 3
+```
+
+Notebook-based models (MIOFlow, prescient, VGFM, DeepRUOT, TrajectoryNet) use [papermill](https://papermill.readthedocs.io/) to inject parameters and execute notebooks from the command line. Script-based models (MMFM, PI-SDE, TIGON, cellot) accept parameters directly via argparse. See each model's `run.sh` for the full list of experiments and their configurations.
+
 ## Citation
 
 If you use PROFET in your research, please cite:
 
 ```bibtex
-@article{cheng2025profet,
+@article{cheng2026profet,
   title={PROFET Predicts Continuous Gene Expression Dynamics
 from scRNA-seq Data to Elucidate Resistance to Cancer Therapy},
-  author={},
-  journal={Preprint},
-  year={2025}
+  author={Cheng YC, Gu H, McDonald TO, Wu W, Tripathi S, Guarducci C, Russo D, Abravanel DL, Bailey M, Wang Y, Zhang Y, Pantazis Y, Levine H, Jeselsohn R, Katsoulakis MA, Michor F},
+  journal={Cell Systems},
+  note={In press},
+  year={2026}
 }
 ```
