@@ -148,8 +148,8 @@ notebooks/<Dataset>.ipynb
 Raw datasets are available for download at:
 [https://drive.google.com/drive/folders/1ba-skCOxvosDQTWz1Rq3GlClk-NH8-eV](https://drive.google.com/drive/folders/1ba-skCOxvosDQTWz1Rq3GlClk-NH8-eV)
 
-Preprocessed datasets (`.pkl` files) are available for download at:
-[https://drive.google.com/drive/folders/1jrh3L8ZrHaGbSQDNA95ZXK383PaJvl9I?usp=drive_link](https://drive.google.com/drive/folders/1jrh3L8ZrHaGbSQDNA95ZXK383PaJvl9I?usp=drive_link)
+Preprocessed datasets (`.pkl` files) are available with CC By 4.0 for download at:
+[https://doi.org/10.5281/zenodo.21014564](https://doi.org/10.5281/zenodo.21014564)
 
 Place each dataset under `data/`:
 
